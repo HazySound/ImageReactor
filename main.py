@@ -19,6 +19,8 @@ print('해상도 :', width, height)
 if not os.path.exists(res_path):
     try:
         os.makedirs(res_path)
+        print("폴더가 생성되었습니다.")
+        print("필요한 이미지들을 폴더 안에 추가해주세요.")
     except:
         print("경로를 만들지 못했습니다.")
 
@@ -121,7 +123,7 @@ try:
             print('* "F12"꾹(중지 메시지가 뜰 때까지) 반복 중지')
 
             while True:
-                time.sleep(0.001)
+                time.sleep(0.001) #CPU 점유율 관리
                 if client_crashed(img_path + 'icon.png'):
                     print("**아이콘 사라짐**")
                     print("절전 방지 모드로 진입합니다.")
@@ -144,7 +146,7 @@ try:
                 print('* "F9" 작업 시작 / "ESC" 프로그램 종료')
                 is_crashed = False
 
-        time.sleep(0.001)
+        time.sleep(0.001)#CPU 점유율 관리
     os.system('pause')
 except KeyboardInterrupt:
     print("프로그램을 종료합니다.")
