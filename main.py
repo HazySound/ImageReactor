@@ -2,18 +2,21 @@
 # 수정 : <HazySound>
 
 import pyautogui as pgi
+import pyscreeze
 import time
 import keyboard
 import pydirectinput as pyd
 import random
 import autoemail
+import path_manager as pm
 import sys
 import os
 
 width, height = pgi.size()  # 화면해상도 확인
-res = str(width) + 'x' + str(height)
-img_path = './resources/' + res + '/'
-res_path = os.path.join(os.getcwd(), 'resources', res)
+
+img_path = pm.get_img_path()
+res_path = pm.get_res_path()
+
 print('해상도 :', width, height)
 
 if not os.path.exists(res_path):
@@ -28,6 +31,7 @@ if not os.path.exists(res_path):
 print('\n* "F9" 반복 시작 / "ESC" 프로그램 종료')
 
 def import_img(file, conf=0.8):
+    pyscreeze.USE_IMAGE_NOT_FOUND_EXCEPTION = False
     try:
         result = pgi.locateCenterOnScreen(file, confidence=conf)
         return result
@@ -44,7 +48,7 @@ def imgclick(files, conf=0.8):  # 이미지 찾아서 클릭 함수
     else:
         x, y = imgfile
         x = x - random.randint(1, 20) + random.randint(1, 20)
-        y = y - random.randint(1, 20) + random.randint(1, 20)
+        y = y - random.randint(1, 20)
         pgi.click(x, y)
         print("클릭함")
 
@@ -100,7 +104,7 @@ def keep_awake():
 def routine():
     print("루틴 시작")
     try:
-        imgclick(img_path + 'click1.png', 0.98)  # 유사치 98% 이상 클릭 1
+        imgclick(img_path + 'click1.png', 0.9)  # 유사치 90% 이상 클릭 1
         skeypress(img_path + 's1.png')  # s키 1
         imgclick(img_path + 'click2.png')  # 클릭 2
         imgclick(img_path + 'click3.png')  # 클릭 3
