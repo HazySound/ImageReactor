@@ -211,6 +211,8 @@ if os.path.exists("routine.lock"):
         messagebox.showwarning("실행 중지", "다른 인스턴스가 실행 중입니다.")
         sys.exit()
 
+# ✅ 여기서 바로 lock 생성
+create_lock()
 
 # 리소스 초기화
 init_resources()
