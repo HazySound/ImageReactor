@@ -188,10 +188,15 @@ init_resources()
 # 루틴 추가 및 체크
 routine_items, client_item = load_routine_from_json()
 if not routine_items:
-    print("❗ 루틴이 없습니다.")
-    print("⛏ 먼저 config.exe에서 루틴을 설정한 후 다시 실행해주세요.")
-    os.system("pause")
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showwarning(
+        "루틴 없음",
+        "루틴이 존재하지 않습니다.\n\n먼저 config.exe에서 루틴을 설정한 후 다시 실행해주세요."
+    )
+    root.destroy()
     sys.exit()
+
 
 print('해상도 :', width, height)
 print('\n* "F9" 반복 시작 / "ESC" 프로그램 종료')
