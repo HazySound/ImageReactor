@@ -1,0 +1,2 @@
+pyinstaller --onefile --icon=resources\icon\icon.ico main.py
+pyinstaller --onefile --noconsole --icon=resources\icon\config.ico config.py

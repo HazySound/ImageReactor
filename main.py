@@ -11,6 +11,7 @@ import pydirectinput as pyd
 import random
 import autoemail
 import path_manager as pm
+from lock_utils import create_lock, remove_lock, check_stale_lock
 import json
 import sys
 import os
@@ -33,7 +34,13 @@ def init_resources():
     except:
         print("텍스트 파일 체크 및 생성에 문제가 발생하였습니다.")
         os.system('pause')
-        sys.exit(0)
+        clean_exit()
+
+
+def clean_exit():
+    if os.path.exists("routine.lock"):
+        remove_lock()
+    sys.exit()
 
 
 def import_img(file, conf=0.8):
@@ -197,6 +204,14 @@ def execute_routine(routine_list):
 
 
 #  --- 메인 실행 파트 ---
+
+# config 프로그램 실행 체크
+if os.path.exists("routine.lock"):
+    if check_stale_lock():
+        messagebox.showwarning("실행 중지", "다른 인스턴스가 실행 중입니다.")
+        sys.exit()
+
+
 # 리소스 초기화
 init_resources()
 
@@ -210,7 +225,7 @@ if not routine_items:
         "루틴이 존재하지 않습니다.\n\n먼저 config.exe에서 루틴을 설정한 후 다시 실행해주세요."
     )
     root.destroy()
-    sys.exit()
+    clean_exit()
 
 
 print('해상도 :', width, height)
@@ -230,6 +245,7 @@ try:
             while True:
                 now = time.time()
 
+                # 루틴에 Client 항목이 존재할 때만 충돌 감지 실행
                 if client_item:
                     client_img_path = img_path + client_item["image"]
                     if os.path.exists(client_img_path) and client_crashed(client_img_path):
@@ -264,6 +280,6 @@ try:
 except KeyboardInterrupt:
     print("프로그램을 종료합니다.")
     os.system('pause')
-    sys.exit(0)
+    clean_exit()
 
 

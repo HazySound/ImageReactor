@@ -5,9 +5,11 @@ from tkinter import messagebox, Scrollbar, Canvas
 from tkinter import Toplevel, Label, Button
 from PIL import Image, ImageTk
 import os
+import sys
 import json
 import path_manager as pm
 import re
+from lock_utils import create_lock, remove_lock, check_stale_lock
 
 
 class ToolTip:
@@ -78,6 +80,12 @@ pm.init_folder()
 
 root = tk.Tk()
 root.title("루틴 설정")
+
+# main 프로그램 실행 여부 확인
+if os.path.exists("routine.lock"):
+    if check_stale_lock():
+        messagebox.showwarning("실행 중지", "다른 인스턴스가 실행 중입니다.")
+        sys.exit()
 
 # 화면 중앙 배치
 window_width = 900
@@ -854,11 +862,17 @@ def delete_routine_by_image(image_name):
 def save_routine():
     global routine_modified
 
-    with open(ROUTINE_FILE, "w", encoding="utf-8") as f:
-        json.dump(routine, f, indent=2)
-    messagebox.showinfo("저장 완료", "routine.json 파일로 저장되었습니다!", parent=root)
+    # 잠금 파일 생성
+    create_lock()
 
-    routine_modified = False
+    try:
+        with open(ROUTINE_FILE, "w", encoding="utf-8") as f:
+            json.dump(routine, f, indent=2)
+        messagebox.showinfo("저장 완료", "routine.json 파일로 저장되었습니다!", parent=root)
+        routine_modified = False
+    finally:
+        # 저장 후 잠금 해제
+        remove_lock()
 
 
 def load_routine():
