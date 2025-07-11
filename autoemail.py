@@ -1,6 +1,33 @@
 # 라이브러리 불러오기
 import smtplib
 from email.mime.text import MIMEText
+import os
+
+
+def ensure_file_exists(filepath, default_content=""):
+    if not os.path.exists(filepath):
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(default_content)
+
+def init_txts():
+    os.makedirs("./resources", exist_ok=True)
+    ensure_file_exists("./resources/email.txt", "example@gmail.com")
+    ensure_file_exists("./resources/id.txt", "example@gmail.com")
+    ensure_file_exists("./resources/pw.txt", "password")
+    ensure_file_exists("./resources/mail_content.txt", "Subject: 메일 제목\n---\n메일 본문 내용")
+
+def load_email_data(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    try:
+        subject_part, body_part = content.split('---', 1)
+        subject = subject_part.replace('Subject:', '').strip()
+        body = body_part.strip()
+        return subject, body
+    except ValueError:
+        return "메일 제목", "메일 내용"
+
 
 def send_email():
     # 개인 정보 입력(email, 앱 비밀번호)
@@ -39,8 +66,10 @@ def send_email():
         return
     else:
         # 이메일 데이터 설정
-        msg = MIMEText("메일내용")
-        msg['Subject'] = "메일제목"
+        subject, body = load_email_data("./resources/mail_content.txt")
+
+        msg = MIMEText(body)
+        msg['Subject'] = subject
         msg['From'] = from_email  # 발신자
         msg['To'] = to_email  # 수신자
 

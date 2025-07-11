@@ -9,6 +9,7 @@ import pydirectinput as pyd
 import random
 import autoemail
 import path_manager as pm
+import json
 import sys
 import os
 
@@ -17,18 +18,28 @@ width, height = pgi.size()  # 화면해상도 확인
 img_path = pm.get_img_path()
 res_path = pm.get_res_path()
 
-print('해상도 :', width, height)
+is_crashed = False
 
-if not os.path.exists(res_path):
+
+def init_resources():
+    # 폴더 체크 및 생성
+    if not os.path.exists(res_path):
+        try:
+            os.makedirs(res_path)
+            print("폴더가 생성되었습니다.")
+            print("필요한 이미지들을 폴더 안에 추가해주세요.")
+        except:
+            print("경로를 만들지 못했습니다.")
+            os.system('pause')
+            sys.exit(0)
+
+    # 텍스트 파일 체크 및 생성
     try:
-        os.makedirs(res_path)
-        print("폴더가 생성되었습니다.")
-        print("필요한 이미지들을 폴더 안에 추가해주세요.")
+        autoemail.init_txts()
     except:
-        print("경로를 만들지 못했습니다.")
-
-
-print('\n* "F9" 반복 시작 / "ESC" 프로그램 종료')
+        print("텍스트 파일 체크 및 생성에 문제가 발생하였습니다.")
+        os.system('pause')
+        sys.exit(0)
 
 def import_img(file, conf=0.8):
     pyscreeze.USE_IMAGE_NOT_FOUND_EXCEPTION = False
@@ -38,12 +49,9 @@ def import_img(file, conf=0.8):
     except pgi.ImageNotFoundException:
         return None
 
-
-
-def imgclick(files, conf=0.8):  # 이미지 찾아서 클릭 함수
+def imgclick(files, conf=0.8):  # 이미지가 있으면 클릭
     imgfile = import_img(files, conf)
     if imgfile == None:
-        #print("imgclick_못 찾음")
         return
     else:
         x, y = imgfile
@@ -52,8 +60,7 @@ def imgclick(files, conf=0.8):  # 이미지 찾아서 클릭 함수
         pgi.click(x, y)
         print("클릭함")
 
-
-def spacepress(file):
+def spacepress(file):  # 이미지가 있으면 Space 누름
     imgfile = import_img(file)
     if imgfile == None:
         return
@@ -66,7 +73,6 @@ def spacepress(file):
 def skeypress(file):  # 이미지가 있으면 S 누름
     imgfile = import_img(file)
     if imgfile == None:
-        #print("skeypress_못 찾음")
         return
     else:
         print("s 눌림")
@@ -74,11 +80,9 @@ def skeypress(file):  # 이미지가 있으면 S 누름
         time.sleep(0.05)
         pyd.keyUp("s")
 
-
-def esckeypress(files):  # 이미지가 있으면 S 누름
+def esckeypress(files):  # 이미지가 있으면 ESC 누름
     imgfile = import_img(files)
     if imgfile == None:
-        #print("esckeypress_못 찾음")
         return
     else:
         print("esc 눌림")
@@ -86,11 +90,10 @@ def esckeypress(files):  # 이미지가 있으면 S 누름
         time.sleep(0.05)
         pyd.keyUp("esc")
 
-is_crashed = False
 def client_crashed(img):
     imgfile = import_img(img, 0.9)
 
-    if imgfile == None: #못 찾으면 이메일 발송
+    if imgfile == None:  # 못 찾으면 이메일 발송
         autoemail.send_email()
         return True
 
@@ -101,21 +104,51 @@ def keep_awake():
     time.sleep(0.05)
     pyd.keyUp("s")
 
-def routine():
-    print("루틴 시작")
-    try:
-        imgclick(img_path + 'click1.png', 0.9)  # 유사치 90% 이상 클릭 1
-        skeypress(img_path + 's1.png')  # s키 1
-        imgclick(img_path + 'click2.png')  # 클릭 2
-        imgclick(img_path + 'click3.png')  # 클릭 3
-        spacepress(img_path + 'space1.png')  # 스페이스바 1
-        spacepress(img_path + 'space2.png')  # 스페이스바 2
-        spacepress(img_path + 'space3.png')  # 스페이스바 3
-        imgclick(img_path + 'click4.png')  # 클릭 4
-        esckeypress(img_path + 'esc.png')  # esc
-        skeypress(img_path + 's2.png')  # s키 2
-    except Exception as e:
-        print("이미지 파일이 있는지 확인해주세요 : ", e)
+def load_routine_from_json(path="./routine.json"):
+    if not os.path.exists(path):
+        return [], None
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw_routine = json.load(f)
+
+    # 하나만 있다고 가정
+    client_item = next((item for item in raw_routine if item["action"] == "Client"), None)
+    ordered_items = sorted(
+        [item for item in raw_routine if item["action"] != "Client"],
+        key=lambda x: x.get("order", 0)
+    )
+    return ordered_items, client_item
+
+def execute_routine(routine_list):
+    for item in routine_list:
+        img_file = img_path + item["image"]
+        action = item["action"]
+        conf = item.get("conf", 0.8)
+
+        if action == "click":
+            imgclick(img_file, conf)
+        elif action == "space":
+            spacepress(img_file)
+        elif action == "s":
+            skeypress(img_file)
+        elif action == "esc":
+            esckeypress(img_file)
+
+
+#  --- 메인 실행 파트 ---
+# 리소스 초기화
+init_resources()
+
+# 루틴 추가 및 체크
+routine_items, client_item = load_routine_from_json()
+if not routine_items:
+    print("❗ 루틴이 없습니다.")
+    print("⛏ 먼저 config.exe에서 루틴을 설정한 후 다시 실행해주세요.")
+    os.system("pause")
+    sys.exit()
+
+print('해상도 :', width, height)
+print('\n* "F9" 반복 시작 / "ESC" 프로그램 종료')
 
 try:
     while True:
@@ -126,31 +159,41 @@ try:
             print('\n============반복 시작============')
             print('* "F12"꾹(중지 메시지가 뜰 때까지) 반복 중지')
 
+            last_run = 0
+            interval = 0.3  # 루틴 실행 간격 (초)
             while True:
-                time.sleep(0.001) #CPU 점유율 관리
-                if client_crashed(img_path + 'icon.png'):
-                    print("**아이콘 사라짐**")
-                    print("절전 방지 모드로 진입합니다.")
-                    print("절전 방지를 종료하고 초기 화면으로 돌아가려면 F12를 3초 가량 꾹 눌러주세요.")
-                    is_crashed = True
-                    break
+                now = time.time()
+
+                if client_item:
+                    client_img_path = img_path + client_item["image"]
+                    if os.path.exists(client_img_path) and client_crashed(client_img_path):
+                        print("**아이콘 사라짐**")
+                        print("절전 방지 모드로 진입합니다.")
+                        print("절전 방지를 종료하고 초기 화면으로 돌아가려면 F12를 3초 가량 꾹 눌러주세요.")
+                        is_crashed = True
+                        break
 
                 if keyboard.is_pressed('F12'):  # F12 중지
                     print('============중지됨============\n\n')
                     print('* "F9" 반복 시작 / "ESC" 프로그램 종료')
                     break
-                else:
-                    routine()
+
+                # ⏱ 루틴 실행 간격 조절
+                if now - last_run >= interval:
+                    execute_routine(routine_items)
+                    last_run = now
+
+                time.sleep(0.01)  # CPU 부담 방지용
 
         elif is_crashed:
-            keep_awake() #절전 방지 - 3초에 한 번씩 S키 누르기
+            keep_awake()  # 절전 방지 - 3초에 한 번씩 S키 누르기
             time.sleep(3)
             if keyboard.is_pressed('F12'):
                 print('============중지됨============\n\n')
                 print('* "F9" 작업 시작 / "ESC" 프로그램 종료')
                 is_crashed = False
 
-        time.sleep(0.001)#CPU 점유율 관리
+        time.sleep(0.1)  # CPU 부담 방지용
     os.system('pause')
 except KeyboardInterrupt:
     print("프로그램을 종료합니다.")
