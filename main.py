@@ -25,15 +25,7 @@ is_crashed = False
 
 def init_resources():
     # 폴더 체크 및 생성
-    if not os.path.exists(res_path):
-        try:
-            os.makedirs(res_path)
-            print("폴더가 생성되었습니다.")
-            print("필요한 이미지들을 폴더 안에 추가해주세요.")
-        except:
-            print("경로를 만들지 못했습니다.")
-            os.system('pause')
-            sys.exit(0)
+    pm.init_folder()
 
     # 텍스트 파일 체크 및 생성
     try:

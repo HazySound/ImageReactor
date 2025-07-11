@@ -72,6 +72,9 @@ routine_modified = False
 
 image_folder = pm.get_img_path()
 
+# 폴더 경로 확인 및 생성
+pm.init_folder()
+
 root = tk.Tk()
 root.title("루틴 설정")
 root.geometry("900x800")
@@ -685,7 +688,6 @@ def on_closing():
             save_routine()
         # 아니오(False)일 경우 그냥 종료 진행
     root.destroy()
-
 
 
 # GUI 초기화 및 실행
