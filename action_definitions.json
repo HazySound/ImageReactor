@@ -1,0 +1,22 @@
+[
+  {
+    "label": "click",
+    "value": "click"
+  },
+  {
+    "label": "space",
+    "value": "space"
+  },
+  {
+    "label": "s",
+    "value": "s"
+  },
+  {
+    "label": "esc",
+    "value": "esc"
+  },
+  {
+    "label": "Client",
+    "value": "Client"
+  }
+]

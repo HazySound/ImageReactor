@@ -35,6 +35,7 @@ def init_resources():
         os.system('pause')
         sys.exit(0)
 
+
 def import_img(file, conf=0.8):
     pyscreeze.USE_IMAGE_NOT_FOUND_EXCEPTION = False
     try:
@@ -42,6 +43,7 @@ def import_img(file, conf=0.8):
         return result
     except pgi.ImageNotFoundException:
         return None
+
 
 def imgclick(files, conf=0.8):  # 이미지가 있으면 클릭
     imgfile = import_img(files, conf)
@@ -54,6 +56,7 @@ def imgclick(files, conf=0.8):  # 이미지가 있으면 클릭
         pgi.click(x, y)
         print("클릭함")
 
+
 def spacepress(file):  # 이미지가 있으면 Space 누름
     imgfile = import_img(file)
     if imgfile == None:
@@ -63,6 +66,7 @@ def spacepress(file):  # 이미지가 있으면 Space 누름
         pyd.keyDown("space")
         time.sleep(0.05)
         pyd.keyUp("space")
+
 
 def skeypress(file):  # 이미지가 있으면 S 누름
     imgfile = import_img(file)
@@ -74,6 +78,7 @@ def skeypress(file):  # 이미지가 있으면 S 누름
         time.sleep(0.05)
         pyd.keyUp("s")
 
+
 def esckeypress(files):  # 이미지가 있으면 ESC 누름
     imgfile = import_img(files)
     if imgfile == None:
@@ -84,6 +89,7 @@ def esckeypress(files):  # 이미지가 있으면 ESC 누름
         time.sleep(0.05)
         pyd.keyUp("esc")
 
+
 def client_crashed(img):
     imgfile = import_img(img, 0.9)
 
@@ -93,10 +99,12 @@ def client_crashed(img):
 
     return False
 
+
 def keep_awake():
     pyd.keyDown("s")
     time.sleep(0.05)
     pyd.keyUp("s")
+
 
 def show_popup_removed_images(removed_images):
     if removed_images:
@@ -108,6 +116,7 @@ def show_popup_removed_images(removed_images):
             f"다음 이미지가 존재하지 않아 루틴에서 제외되었습니다:{removed_list}"
         )
         root.destroy()
+
 
 def load_routine_from_json(path="./routine.json"):
     if not os.path.exists(path):
@@ -156,6 +165,7 @@ def load_routine_from_json(path="./routine.json"):
 
     return cleaned_routine, client_item
 
+
 def execute_routine(routine_list):
     print("루틴 시작")
     for item in routine_list:
@@ -171,6 +181,19 @@ def execute_routine(routine_list):
             skeypress(img_file)
         elif action == "esc":
             esckeypress(img_file)
+        else:
+            imgfile = import_img(img_file, conf)
+            if imgfile:
+                keys = action.split('+')
+                try:
+                    for k in keys:
+                        pyd.keyDown(k)
+                    time.sleep(0.05)
+                    for k in reversed(keys):
+                        pyd.keyUp(k)
+                    print(f"{action} 눌림")
+                except Exception as e:
+                    print(f"[실패] {action} 동작은 실행되지 않았습니다 (키 입력 오류)")
 
 
 #  --- 메인 실행 파트 ---
