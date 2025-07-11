@@ -1,6 +1,8 @@
 # 제작 : killsonic@naver.com 불닭@네이버
 # 수정 : <HazySound>
 
+import tkinter as tk
+from tkinter import messagebox
 import pyautogui as pgi
 import pyscreeze
 import time
@@ -104,6 +106,17 @@ def keep_awake():
     time.sleep(0.05)
     pyd.keyUp("s")
 
+def show_popup_removed_images(removed_images):
+    if removed_images:
+        root = tk.Tk()
+        root.withdraw()
+        removed_list = "\n- " + "\n- ".join(removed_images)
+        messagebox.showinfo(
+            "루틴 항목 일부 제거됨",
+            f"다음 이미지가 존재하지 않아 루틴에서 제외되었습니다:{removed_list}"
+        )
+        root.destroy()
+
 def load_routine_from_json(path="./routine.json"):
     if not os.path.exists(path):
         return [], None
@@ -111,15 +124,48 @@ def load_routine_from_json(path="./routine.json"):
     with open(path, "r", encoding="utf-8") as f:
         raw_routine = json.load(f)
 
-    # 하나만 있다고 가정
-    client_item = next((item for item in raw_routine if item["action"] == "Client"), None)
-    ordered_items = sorted(
-        [item for item in raw_routine if item["action"] != "Client"],
+    cleaned_routine = []
+    client_item = None
+    removed_images = []
+
+    for item in raw_routine:
+        image_path = img_path + item["image"]
+        if os.path.exists(image_path):
+            if item["action"] == "Client":
+                client_item = item
+            else:
+                cleaned_routine.append(item)
+        else:
+            removed_images.append(item["image"])
+
+    if removed_images:
+        # 알림 팝업
+        show_popup_removed_images(removed_images)
+
+        # 저장 여부 팝업
+        root = tk.Tk()
+        root.withdraw()
+        answer = messagebox.askyesno(
+            "루틴 동기화",
+            "존재하지 않는 이미지 항목이 제거되었습니다.\nroutine.json 파일을 동기화할까요?\n\n(동기화하지 않을 경우, 누락된 이미지는 루틴에서 제외된 상태로 실행됩니다.)"
+        )
+        root.destroy()
+
+        if answer:
+            all_items = cleaned_routine + ([client_item] if client_item else [])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(all_items, f, indent=2)
+            print("[info] routine.json 파일이 자동 동기화되었습니다.")
+
+    cleaned_routine = sorted(
+        cleaned_routine,
         key=lambda x: x.get("order", 0)
     )
-    return ordered_items, client_item
+
+    return cleaned_routine, client_item
 
 def execute_routine(routine_list):
+    print("루틴 시작")
     for item in routine_list:
         img_file = img_path + item["image"]
         action = item["action"]

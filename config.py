@@ -6,6 +6,7 @@ from PIL import Image, ImageTk
 import os
 import json
 import path_manager as pm
+import re
 
 
 class ToolTip:
@@ -66,6 +67,9 @@ image_buttons = {}  # 버튼 참조용
 selected_image = None
 highlight_line = None
 
+# 루틴 변경 여부 확인 플래그
+routine_modified = False
+
 image_folder = pm.get_img_path()
 
 root = tk.Tk()
@@ -85,6 +89,8 @@ selected_routine_index = None
 top_frame = tk.Frame(root)
 top_frame.pack(pady=10, fill="x")
 tk.Label(top_frame, text="🖼 이미지 파일 목록", font=("맑은 고딕", 13, "bold")).pack()
+tk.Label(top_frame, text="※ 한글이 포함된 이미지 파일은 표시되지 않습니다", font=("맑은 고딕", 9), fg="gray").pack()
+
 
 canvas = Canvas(top_frame, height=220, width=820)
 scroll_y = Scrollbar(top_frame, orient="vertical", command=canvas.yview)
@@ -95,9 +101,16 @@ canvas.configure(yscrollcommand=scroll_y.set)
 canvas.pack(side="top", fill="both", expand=True)
 scroll_y.pack(side="right", fill="y")
 
+def contains_korean(text):
+    return bool(re.search(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', text))
+
 row, col = 0, 0
 for file_name in os.listdir(image_folder):
     if file_name.lower().endswith(".png"):
+        if contains_korean(file_name):
+            print(f"[제외됨] 한글 포함 파일: {file_name}")
+            continue  # 한글 포함 파일은 무시
+
         image_list.append(file_name)
         path = os.path.join(image_folder, file_name)
         img = Image.open(path)
@@ -111,6 +124,7 @@ for file_name in os.listdir(image_folder):
         if col >= 5:
             col = 0
             row += 1
+
 
 # 본문
 main_frame = tk.Frame(root)
@@ -220,7 +234,7 @@ def update_client_preview():
         if item['action'] == "Client":
             path = os.path.join(image_folder, item['image'])
             if not os.path.exists(path):
-                continue
+                return
             img = Image.open(path)
             img.thumbnail((50, 50))
             tk_img = ImageTk.PhotoImage(img)
@@ -253,10 +267,6 @@ def update_client_preview():
 
             # 🔵 삭제 바인딩 (텍스트)
             text_label.bind("<Button-3>", lambda e, i=routine.index(item): delete_routine(i))
-
-
-
-
 
 def update_preview():
     update_client_preview()
@@ -438,7 +448,7 @@ def sync_conf_entry(*args):
     conf_entry.insert(0, f"{conf_var.get():.2f}")
 
 def add_routine():
-    global selected_image
+    global selected_image, routine_modified
     if not selected_image:
         return
 
@@ -498,7 +508,11 @@ def add_routine():
     selected_image_thumb.image = None
     update_save_button_state()
 
+    routine_modified = True
+
 def delete_routine(index):
+    global routine_modified
+
     image = routine[index]['image']
     routine.pop(index)
     for i, r in enumerate(routine):
@@ -511,35 +525,64 @@ def delete_routine(index):
     update_preview()
     update_save_button_state()
 
+    routine_modified = True
+
 def delete_routine_by_image(image_name):
+    global routine_modified
+
     index = next((i for i, r in enumerate(routine) if r['image'] == image_name), None)
     if index is not None:
         delete_routine(index)
+        routine_modified = True  # 루틴 변경됨
 
 def save_routine():
+    global routine_modified
+
     with open(ROUTINE_FILE, "w", encoding="utf-8") as f:
         json.dump(routine, f, indent=2)
     messagebox.showinfo("저장 완료", "routine.json 파일로 저장되었습니다!")
 
+    routine_modified = False
+
 def load_routine():
-    global routine
+    global routine, routine_modified
+    removed_images = []
+
     if os.path.exists(ROUTINE_FILE):
         try:
             with open(ROUTINE_FILE, "r", encoding="utf-8") as f:
-                routine = json.load(f)
+                loaded = json.load(f)
 
-            # conf 누락 시 기본값 보정
-            for item in routine:
+            valid_routine = []
+            for item in loaded:
                 if "conf" not in item:
                     item["conf"] = 0.9 if item["action"] == "Client" else 0.8
 
-            # 이미지 목록 버튼 중 루틴에 포함된 이미지 비활성화
+                image_path = os.path.join(image_folder, item['image'])
+                if os.path.exists(image_path):
+                    valid_routine.append(item)
+                else:
+                    print(f"[제외됨] 존재하지 않는 이미지로 저장된 항목 제거됨: {item['image']}")
+                    removed_images.append(item['image'])
+
+            # json과 실제 이미지 간 불일치가 있었던 경우
+            if removed_images:
+                routine_modified = True  # 자동 변경이므로 저장 여부를 묻도록 함
+                removed_list = "\n- " + "\n- ".join(removed_images)
+                messagebox.showinfo(
+                    "루틴 일부 항목 제거됨",
+                    f"이미지 파일의 이름 변경 등의 이유로\n저장된 루틴 목록에서 다음 항목이 제거되었습니다:{removed_list}"
+                )
+
+            routine = valid_routine
+
             for item in routine:
                 if item['image'] in image_buttons:
                     image_buttons[item['image']].config(state="disabled")
 
             update_preview()
             update_client_action_menu()
+
         except Exception as e:
             messagebox.showerror("로드 실패", f"routine.json 파일을 불러오는 중 오류 발생:\n{e}")
 
@@ -605,7 +648,7 @@ def drag_release(index):
             update_preview()
 
 def drag_release_by_image(image_name):
-    global highlight_line
+    global highlight_line, routine_modified
     if highlight_line:
         row = highlight_line.grid_info().get("row")
         highlight_line.destroy()
@@ -631,15 +674,27 @@ def drag_release_by_image(image_name):
         routine.extend(client_routine + non_client_routine)
 
         update_preview()
+        routine_modified = True  # 루틴 변경됨
+
+def on_closing():
+    if routine_modified:
+        result = messagebox.askyesnocancel("저장 확인", "루틴을 저장하지 않았습니다.\n저장하시겠습니까?")
+        if result is None:  # [취소]
+            return
+        elif result:        # [예]
+            save_routine()
+        # 아니오(False)일 경우 그냥 종료 진행
+    root.destroy()
 
 
-#GUI 초기화 및 실행
+
+# GUI 초기화 및 실행
 load_routine()
-update_preview()
 preview_canvas.bind("<MouseWheel>", on_mousewheel)
 preview_frame.bind("<MouseWheel>", on_mousewheel)
 conf_var.trace_add("write", sync_conf_entry)
 action_var.trace_add("write", on_action_change)
 conf_entry.bind("<Return>", sync_conf_slider)
 conf_entry.bind("<FocusOut>", sync_conf_slider)
+root.protocol("WM_DELETE_WINDOW", on_closing)
 root.mainloop()
