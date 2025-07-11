@@ -84,8 +84,13 @@ root.title("루틴 설정")
 # main 프로그램 실행 여부 확인
 if os.path.exists("routine.lock"):
     if check_stale_lock():
-        messagebox.showwarning("실행 중지", "다른 인스턴스가 실행 중입니다.")
+        messagebox.showwarning(
+            "실행 차단됨",
+            "자동 루틴 실행 프로그램(ImageReactor)이 실행 중입니다.\n\n해당 프로그램을 먼저 종료한 후 다시 시도해주세요."
+        )
         sys.exit()
+
+create_lock()  # ✅ config 실행 중임을 알리는 잠금 생성
 
 # 화면 중앙 배치
 window_width = 900
@@ -1019,6 +1024,8 @@ def on_closing():
         elif result:        # [예]
             save_routine()
         # 아니오(False)일 경우 그냥 종료 진행
+
+    remove_lock()  # ✅ config 종료 시 잠금 해제
     root.destroy()
 
 

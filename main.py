@@ -208,7 +208,11 @@ def execute_routine(routine_list):
 # config 프로그램 실행 체크
 if os.path.exists("routine.lock"):
     if check_stale_lock():
-        messagebox.showwarning("실행 중지", "다른 인스턴스가 실행 중입니다.")
+        messagebox.showwarning(
+            "실행 차단됨",
+            "루틴 설정 프로그램(config)이 실행 중입니다.\n\n해당 프로그램을 종료한 후 다시 실행해주세요."
+        )
+
         sys.exit()
 
 # ✅ 여기서 바로 lock 생성
