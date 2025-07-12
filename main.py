@@ -283,6 +283,7 @@ try:
 
         time.sleep(0.1)  # CPU 부담 방지용
     os.system('pause')
+    clean_exit()
 except KeyboardInterrupt:
     print("프로그램을 종료합니다.")
     os.system('pause')
