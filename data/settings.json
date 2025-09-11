@@ -16,9 +16,9 @@
     "smtp_host": "",
     "smtp_port": 587,
     "use_tls": true,
-    "sender": "fcmining.notice@gmail.com",
-    "app_password": "rbff grxh odhg edch",
-    "recipients": "cemigs1@gmail.com",
+    "sender": "",
+    "app_password": "",
+    "recipients": "",
     "subject_tmpl": "[자동 이메일 테스트]",
     "body_tmpl": "테스트용 메일입니다",
     "events": {
