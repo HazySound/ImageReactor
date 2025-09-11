@@ -20,7 +20,7 @@ from core.ocr import (
     set_tesseract_path,
     _match_out_of_range_ko as _is_oor_ko,
 )
-from path_manager import ASSETS_DIR, SETTINGS_JSON, BASE_DIR
+from path_manager import ASSETS_DIR, SETTINGS_JSON, RESOURCES_DIR
 import path_manager as pm
 from ui.preset_editor import PresetEditorDialog
 from ui.settings_dialog import SettingsDialog
@@ -99,6 +99,15 @@ class OverlayApp(ctk.CTk):
         self.geometry("640x400")
         self.minsize(640, 360)
         self.resizable(False, False)
+
+        # ★ 작업표시줄/타이틀바 아이콘 지정 (Windows)
+        try:
+            ico_path = os.path.join(str(RESOURCES_DIR), "icon", "icon.ico")
+            if os.path.exists(ico_path):
+                # Tk에게 큰/작은 아이콘 모두 전달 (Windows에서 작업표시줄에도 반영)
+                self.iconbitmap(ico_path)
+        except Exception:
+            pass
 
         # 알파(포인터 따라 투명도)
         self.idle_alpha = float(self.settings.get("gui.idle_alpha", 0.35))
@@ -807,6 +816,13 @@ class OverlayApp(ctk.CTk):
         except Exception:
             pass
 
+        # ── 추가: 편집기 띄우는 동안 알파 트래킹 일시 정지 ──
+        try:
+            if hasattr(self, "set_alpha_tracking_enabled"):
+                self.set_alpha_tracking_enabled(False)  # ★ add
+        except Exception:
+            pass
+
         dlg = PresetEditorDialog(self, self.settings)
         try:
             dlg.transient(self)
@@ -817,6 +833,13 @@ class OverlayApp(ctk.CTk):
             pass
 
         self.wait_window(dlg)
+
+        # ── 복귀: 알파 트래킹 재개 ──
+        try:
+            if hasattr(self, "set_alpha_tracking_enabled"):
+                self.set_alpha_tracking_enabled(True)  # ★ add
+        except Exception:
+            pass
 
         try:
             self.attributes("-topmost", prev_top)
@@ -829,6 +852,11 @@ class OverlayApp(ctk.CTk):
             pass
         try:
             self._refresh_goal_combo()
+        except Exception:
+            pass
+
+        try:
+            self._sync_goal_visual()  # ★ add
         except Exception:
             pass
 

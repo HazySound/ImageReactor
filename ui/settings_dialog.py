@@ -4,7 +4,6 @@ import threading
 import customtkinter as ctk
 from tkinter import messagebox
 import autoemail
-from ui.preset_panel import PresetEditorPanel
 from path_manager import BASE_DIR  # ← 추가
 
 GMAIL = "@gmail.com"
@@ -213,15 +212,13 @@ class SettingsDialog(ctk.CTkToplevel):
         self.content = ctk.CTkFrame(root);           self.content.grid(row=0, column=1, sticky="nsew")
 
         ctk.CTkButton(self.tabbar, text="이메일 설정", command=self._show_email_tab).pack(fill="x", pady=(0,6))
-        ctk.CTkButton(self.tabbar, text="프리셋 설정", command=self._show_preset_tab).pack(fill="x")
 
-        self.page_email  = ctk.CTkFrame(self.content)
-        self.page_preset = ctk.CTkFrame(self.content)
-        for p in (self.page_email, self.page_preset): p.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.page_email = ctk.CTkFrame(self.content)
+        self.page_email.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         self._build_email_page(self.page_email)
-        self._build_preset_page(self.page_preset)
         self._show_email_tab()
+        # (프리셋 페이지/빌더 호출 제거)
 
         self._parent_app = parent
         try:
@@ -287,19 +284,86 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _refresh_scroll_after_toggle(self, to_top: bool = False) -> None:
+        """
+        제목/본문 섹션을 보이거나 숨긴 직후 scrollregion 재계산과 뷰 위치 보정을 수행한다.
+        - to_top=True : 맨 위로 스크롤(숨김 시 권장)
+        - to_top=False: 현 뷰 위치 유지(보임 시 권장)
+        """
+        try:
+            # msg_section가 스크롤러(CTkScrollableFrame) 안에 있으므로 그 캔버스를 찾는다.
+            container = getattr(self, "msg_section", None)
+            if container is None:
+                return
+            parent = container.master
+            canvas = None
+
+            # 1) CTkScrollableFrame의 내부 Canvas는 통상 _parent_canvas 속성으로 노출된다.
+            try:
+                canvas = getattr(parent, "_parent_canvas", None)
+            except Exception:
+                canvas = None
+
+            # 2) 혹시 위 방식이 실패하면 부모/자식 위젯들 중 Canvas를 탐색(보수적 가드)
+            if canvas is None:
+                try:
+                    for child in parent.winfo_children():
+                        if str(child.winfo_class()).lower() == "canvas":
+                            canvas = child
+                            break
+                except Exception:
+                    pass
+
+            if canvas is None:
+                return
+
+            # 레이아웃을 먼저 확정시킨 뒤 scrollregion을 재계산한다.
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+
+            try:
+                bbox = canvas.bbox("all")
+                if bbox is not None:
+                    canvas.configure(scrollregion=bbox)
+            except Exception:
+                pass
+
+            # 숨김 전환 등으로 콘텐츠 높이가 크게 줄었을 때 안전하게 맨 위로 올린다.
+            if to_top:
+                try:
+                    canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
     def _apply_subject_section_visibility(self):
         """전역 '이메일 알림 사용' 상태에 따라 제목/내용 섹션을 숨기거나 보인다."""
         try:
             if bool(self.var_enabled.get()):
-                self.msg_section.grid()  # 보이기
-                # --- 중요: 레이아웃 settle 후에 placeholder 동기화 (레이스 방지) ---
+                # 보이기
+                self.msg_section.grid()
+                # 레이아웃 settle 후 placeholder + scrollregion 동기화 (뷰 위치는 유지)
                 try:
                     self.after_idle(self._sync_event_placeholders)
                 except Exception:
                     pass
+                try:
+                    # 숨김→보임 전환에서도 scrollregion은 재계산해 둔다
+                    self.after_idle(lambda: self._refresh_scroll_after_toggle(to_top=False))
+                except Exception:
+                    pass
             else:
-                self.msg_section.grid_remove()  # 숨기기
-
+                # 숨기기
+                self.msg_section.grid_remove()
+                # 레이아웃 반영 후 scrollregion 재계산 + 안전하게 맨 위로 스크롤
+                try:
+                    self.after_idle(lambda: self._refresh_scroll_after_toggle(to_top=True))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -881,6 +945,8 @@ class SettingsDialog(ctk.CTkToplevel):
                 messagebox.showwarning("부족한 입력", "필수 정보를 모두 입력해야 이메일 알림을 켤 수 있습니다.", parent=self)
                 self.var_enabled.set(False)
         self._apply_subject_section_visibility()
+        # 토글 핸들러의 마지막에:
+        self.after_idle(lambda: self._refresh_scroll_after_toggle(to_top=not self.var_enabled.get()))
 
     def _collect_email_cfg(self) -> dict:
         sender_id = (self.ent_sender_id.get() or "").strip()
@@ -1201,8 +1267,6 @@ class SettingsDialog(ctk.CTkToplevel):
     # ------- preset tab -------
     def _build_preset_page(self, parent):
         parent.grid_columnconfigure(0, weight=1); parent.grid_rowconfigure(0, weight=1)
-        PresetEditorPanel(parent, self.settings).grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
     # ------- page switch -------
     def _show_email_tab(self):  self.page_email.lift()
-    def _show_preset_tab(self): self.page_preset.lift()

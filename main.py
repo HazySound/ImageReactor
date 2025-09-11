@@ -155,6 +155,32 @@ _AWAIT_ENTER_MS: Optional[int] = None   # AWAIT_HOME 진입 시각(ms)
 _AWAIT_SETTLE_MS: int = 1200            # 현재 사이클 settle 목표(ms)
 # [추가] 파일 상단 전역(다른 전역들과 같은 레벨)
 _RUNTIME_LOG_CB = None
+# --- [ADD] 홈-OCR 제어 플래그 ---
+_WANT_AWAIT_HOME: bool = False   # 루틴 단락이 실제로 발생했을 때만 AWAIT_HOME 시작
+_HOME_OCR_DONE: bool = False     # '현재 홈 체류'에서 OCR을 1회 수행했는가
+
+
+# --- [ADD] 로컬 헬퍼: 이 루틴 이미지가 '등록된 홈 앵커 템플릿'인가? ---
+def _is_home_anchor(img_file: str) -> bool:
+    """
+    - 문자열 이름이 아니라 '등록된 템플릿 경로'와 동일한지로만 판정
+    - 경로가 같으면 True, 아니면 False
+    """
+    try:
+        if not _HOME_TPL_PATH:
+            return False
+        import os
+        a = os.path.abspath(img_file)
+        b = os.path.abspath(_HOME_TPL_PATH)
+        # samefile은 Windows에서도 가끔 예외가 나므로 절대경로 비교 우선
+        if a == b:
+            return True
+        try:
+            return os.path.samefile(a, b)
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def _roi_candidates(key: str) -> list[tuple[int,int,int,int]]:
@@ -663,6 +689,7 @@ def load_routine_from_json(path="./routine.json"):
 
 
 def execute_routine(routine_list):
+    global _HOME_OCR_DONE, _WANT_AWAIT_HOME
     for item in routine_list:
         img_file = img_path + item["image"]
         action = item["action"]
@@ -671,6 +698,16 @@ def execute_routine(routine_list):
         if action in ("click", "space", "s", "esc"):
             hit, center = _routine_locate_adaptive(img_file, conf)
             if hit:
+                # --- [ADD] 홈 앵커 단락: 홈 템플릿이면 입력(클릭/키) 스킵 → 화면 전환 방지
+                # 바깥 루프가 직후 AWAIT_HOME(홈 OCR)을 기존 로직대로 시작한다.
+                # 이번 '홈 체류'에서 아직 OCR을 하지 않았을 때만 단락
+                if _is_home_anchor(img_file):
+                    if not _HOME_OCR_DONE:
+                        _WANT_AWAIT_HOME = True  # ← 이번 사이클에서만 AWAIT_HOME 허용
+                        return
+                    else:
+                        _HOME_OCR_DONE = False
+
                 if action == "click":
                     _do_click(center, label=action, src_img=img_file)
                 else:
@@ -682,6 +719,13 @@ def execute_routine(routine_list):
             if not hit:
                 # _log(f"[routine] not found (combo-guard): img='{os.path.basename(img_file)}' action='{action}'")
                 continue
+            # --- [ADD] 홈 앵커면 조합키도 스킵
+            if _is_home_anchor(img_file):
+                if not _HOME_OCR_DONE:
+                    _WANT_AWAIT_HOME = True  # ← 이번 사이클에서만 AWAIT_HOME 허용
+                    return
+                else:
+                    _HOME_OCR_DONE = False
             keys = [k.strip() for k in action.split('+')]
             try:
                 for k in keys: pyd.keyDown(k)
@@ -841,7 +885,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
     _USE_PREPROCESS_FALLBACK = bool(SETTINGS.get("ocr.use_preprocess_fallback", False))
 
     # 전역 간격 변수 초기화(초깃값 350 → 설정값으로 덮어씀)
-    global _HOME_TPL_PATH, _CACHED_ROI, _SKIP_FILE_ROI_ONCE, _CONFIRM_WINDOW_MS, _AWAIT_ENTER_MS, _AWAIT_SETTLE_MS, _RUNTIME_LOG_CB
+    global _HOME_TPL_PATH, _CACHED_ROI, _SKIP_FILE_ROI_ONCE, _CONFIRM_WINDOW_MS, _AWAIT_ENTER_MS, _AWAIT_SETTLE_MS
+    global _RUNTIME_LOG_CB, _WANT_AWAIT_HOME, _HOME_OCR_DONE
     _CONFIRM_WINDOW_MS = _GOAL_CONFIRM_WINDOW_MS
     _RUNTIME_LOG_CB = log_cb
 
@@ -965,8 +1010,9 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                     # 결과 트리거 직후 AWAIT_HOME 시작
                     # main.py - 반복 루프 내 probe 생성 지점
-                    if GOAL_ENABLED and GOAL_AVAILABLE:
+                    if GOAL_ENABLED and GOAL_AVAILABLE and _WANT_AWAIT_HOME:
                         if probe is None:
+                            _WANT_AWAIT_HOME = False  # ← 소비하고 바로 리셋
                             probe = HomeProbe(
                                 ncc_threshold=load_home_anchor_threshold(),
                                 soft_timeout_ms=8000,
@@ -1183,6 +1229,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                         # 여기서 HOME을 유지하며 추가 샘플링하고 싶으면 위 OCR/판정을 주기적으로 반복
                         # 최소 통합: 1샷 판정 후 종료/이탈 처리
+                        _HOME_OCR_DONE = True  # ← 이번 '홈 체류'에서 OCR 완료 표시 (달성/미달 모두 공통)
                         goal_policy.on_home_exit()  # 홈 이탈 훅(버퍼 정리) :contentReference[oaicite:12]{index=12}
                         probe = None
                         # [ADD] settle 가드 리셋
@@ -1198,6 +1245,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                             pass
                         # HOME 확정 실패 → 캐시 리셋
                         _CACHED_ROI = None
+                        _HOME_OCR_DONE = False
                         # [CHANGE] 풀프레임 강제는 세션 누적 2회까지만 허용
                         if _HOME_FF_TRIES < 2:
                             _SKIP_FILE_ROI_ONCE = True
