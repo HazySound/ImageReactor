@@ -1,8 +1,9 @@
 # 전체 코드 재작성: 기능 통합 및 최적화
 
 import tkinter as tk
-from tkinter import messagebox, Scrollbar, Canvas
-from tkinter import Toplevel, Label, Button
+from tkinter import messagebox, Scrollbar, Canvas, Toplevel, Label, Button
+from core.home_anchor import is_home_configured
+from core import home_anchor as HANCH
 from PIL import Image, ImageTk
 import os
 import sys
@@ -70,11 +71,17 @@ image_buttons = {}  # 버튼 참조용
 selected_image = None
 highlight_line = None
 
+# Home 포인터(별도 저장소) 파일
+HOME_ANCHOR_FILE = "home_anchor.json"  # ★ 순수 상대경로
+
+# 메모리 캐시
+home_anchor = None  # 예: {"image": "foo.png", "threshold": 0.88}
+
 # 루틴 변경 여부 확인 플래그
 routine_modified = False
 
+pm.chdir_to_base()
 image_folder = pm.get_img_path()
-
 # 폴더 경로 확인 및 생성
 pm.init_folder()
 
@@ -94,7 +101,7 @@ create_lock()  # ✅ config 실행 중임을 알리는 잠금 생성
 
 # 화면 중앙 배치
 window_width = 900
-window_height = 800
+window_height = 900
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 x = int((screen_width - window_width) / 2)
@@ -124,7 +131,8 @@ def load_action_definitions():
         {"label": "space", "value": "space"},
         {"label": "s", "value": "s"},
         {"label": "esc", "value": "esc"},
-        {"label": "Client", "value": "Client"}
+        {"label": "Client", "value": "Client"},
+        {"label": "Home", "value": "Home"}  # ← 추가
     ]
 
     if not os.path.exists("action_definitions.json"):
@@ -150,17 +158,13 @@ action_var = tk.StringVar(value="click")
 action_objects = load_action_definitions()
 
 # 동작 동적 추가/삭제 관련 상수 및 함수 정의
-FIXED_ACTIONS = ["click", "space", "s", "esc", "Client"]  # 삭제 불가능한 동작 목록
-
-selected_action_label = tk.StringVar()
-selected_action_label.set("click")  # 초기값
+FIXED_ACTIONS = ["click", "space", "s", "esc", "Client", "Home"]  # 삭제 불가능한 동작 목록
 
 
 def set_client_action_menu_state(enable=True):
-    for i, obj in enumerate(action_objects):
-        if obj["value"] == "Client":
-            state = "normal" if enable else "disabled"
-            action_menu_btn.menu.entryconfig(i, state=state)
+    # 메뉴 상태는 update_action_menu()에서 컨텍스트 기반으로 재계산한다.
+    # enable 인자는 호환성만 유지(무시).
+    update_action_menu()
 
 
 def save_action_definitions():
@@ -172,15 +176,39 @@ def update_action_menu():
     menu = action_menu_btn.menu
     menu.delete(0, "end")
 
+    # 현재 컨텍스트
+    selected_name = selected_image_var.get()  # 현재 선택 이미지 (없으면 "")
+    has_client = any(r['action'] == "Client" for r in routine)
+    client_taken_by_other = any(
+        r['action'] == "Client" and r['image'] != selected_name
+        for r in routine
+    )
+
+    # 메뉴 재생성: 'Home'은 액션이 아니므로 숨김
     for obj in action_objects:
+        v = obj["value"]
+        if v == "Home":
+            continue
+
+        # Client는 이미 다른 이미지가 차지하고 있으면 비활성화
+        state = "normal"
+        if v == "Client" and has_client and client_taken_by_other:
+            state = "disabled"
+
         menu.add_command(
             label=obj["label"],
-            command=lambda v=obj["value"]: on_action_selected(v)
+            state=state,
+            command=lambda v=v: on_action_selected(v)
         )
 
-    # 선택된 값 기준으로 표시 텍스트(label) 동기화
+    # 선택 표시 라벨 동기화 + 레거시 가드
     current_value = action_var.get()
-    match = next((o for o in action_objects if o["value"] == current_value), None)
+    if current_value == "Home":
+        action_var.set("click")
+        current_value = "click"
+
+    match = next((o for o in action_objects
+                  if o["value"] == current_value and o["value"] != "Home"), None)
     if match:
         selected_action_label.set(match["label"])
 
@@ -430,7 +458,7 @@ def delete_current_action():
 
 
 action_top = tk.Frame(left_frame)
-action_top.pack(anchor="w", pady=(20, 10))
+action_top.pack(anchor="w", pady=(50, 10))
 
 tk.Label(action_top, text="입력 동작 선택", font=("맑은 고딕", 11)).grid(row=0, column=0, sticky="w", padx=(0, 10))
 
@@ -457,20 +485,18 @@ def on_action_selected(value):
 
 
 # 메뉴 초기 구성
-for obj in action_objects:
-    action_menu_btn.menu.add_command(label=obj["label"], command=lambda v=obj["value"]: on_action_selected(v))
-
+update_action_menu()
 action_menu_btn.pack(anchor="w")
 
 action_display_label = tk.Label(left_frame, text="선택된 동작: click", font=("맑은 고딕", 10), anchor="w")
 action_display_label.pack(anchor="w", pady=(0, 10))
 
 # conf 설정 라벨
-tk.Label(left_frame, text="인식 유사도", font=("맑은 고딕", 11)).pack(anchor="w", pady=(20, 10))
+tk.Label(left_frame, text="인식 유사도", font=("맑은 고딕", 11)).pack(anchor="w", pady=(50, 10))
 
 # 슬라이더 + 숫자 입력 프레임
 conf_frame = tk.Frame(left_frame)
-conf_frame.pack(anchor="w", pady=(0, 20))  # 버튼들과 충분한 간격 확보
+conf_frame.pack(anchor="w", pady=(0, 50))  # 버튼들과 충분한 간격 확보
 
 # 슬라이더
 conf_slider = tk.Scale(conf_frame, from_=0.8, to=0.99, resolution=0.01,
@@ -509,6 +535,36 @@ client_frame.pack(anchor="w", pady=(10, 0))
 tk.Label(client_frame, text="🟦 클라이언트 감지용 아이콘", font=("맑은 고딕", 11, "bold"), anchor="w").pack(anchor="w")
 client_display = tk.Frame(client_frame)
 client_display.pack(anchor="w")
+
+# Home 전용 표시 영역
+# 프레임을 가로로 꽉 채워서 라벨과 버튼이 붙지 않도록 함
+anchor_frame = tk.Frame(right_frame)
+anchor_frame.pack(anchor="w", pady=(10, 0), fill="x")  # ← fill="x" 추가
+
+anchor_header = tk.Frame(anchor_frame)
+anchor_header.pack(fill="both", expand=True)           # ← expand=True
+
+# 왼쪽 라벨 (오른쪽 버튼과 충분한 간격 확보를 위해 padx 부여 + expand)
+anchor_title = tk.Label(anchor_header, text="🟨 홈화면 감지용 이미지",
+                        font=("맑은 고딕", 11, "bold"))
+anchor_title.pack(side="left", padx=(0, 12))           # ← 라벨 우측 여백
+# 라벨이 공간을 먹도록 빈 spacer 추가 (버튼들을 실제 우측 끝으로 밀기)
+tk.Frame(anchor_header).pack(side="left", expand=True, fill="x")  # ← 스페이서
+
+# 우측 버튼 묶음
+anchor_btns = tk.Frame(anchor_header)
+anchor_btns.pack(side="right", padx=(0, 4))            # ← 전체 버튼 묶음 좌측 여백
+
+anchor_register_btn = tk.Button(anchor_btns, text="등록", width=8)
+anchor_register_btn.pack(side="left", padx=(0, 6))
+
+anchor_clear_btn = tk.Button(anchor_btns, text="해제", width=8, state="disabled")
+anchor_clear_btn.pack(side="left")
+
+
+# 미리보기 영역
+anchor_display = tk.Frame(anchor_frame)
+anchor_display.pack(anchor="w")
 
 
 def on_action_change(*args):
@@ -557,6 +613,129 @@ def on_mousewheel(event):
             preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
+def update_home_anchor_preview():
+    anchor_display.grid_columnconfigure(0, weight=0)  # 썸네일 고정 폭
+    anchor_display.grid_columnconfigure(1, weight=1)  # 파일명은 남는 공간 사용
+    # 우측 '홈화면 감지용 이미지' 카드 리프레시
+    for w in anchor_display.winfo_children():
+        w.destroy()
+
+    home_img = get_current_home_image()
+
+    # 미지정 상태
+    if not home_img:
+        tk.Label(anchor_display, text="(미등록)", font=("맑은 고딕", 10), fg="gray").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        return
+
+    path = os.path.join(image_folder, home_img)
+
+    # 파일 없음 → 자동 해제 후 미등록 표시
+    if not os.path.exists(path):
+        save_home_anchor(None)
+        # 미등록 UI 렌더
+        for w in anchor_display.winfo_children():
+            w.destroy()
+        tk.Label(anchor_display, text="(미등록)", font=("맑은 고딕", 10), fg="gray").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w"
+        )
+        update_home_controls_state()
+        return
+
+    # 정상 렌더
+    # 미리보기 영역은 좌우로도 조금 여유
+    anchor_display.pack(anchor="w", pady=(6, 0), fill="x")  # ← 상단에서 한 번만 호출되면 OK
+
+    # 썸네일 크기 상향 + 여백 확보
+    thumb_w, thumb_h = 64, 64  # 필요하면 72~80까지 여유 가능
+    img = Image.open(path)
+    img.thumbnail((thumb_w, thumb_h))  # 종횡비 유지
+
+    tk_img = ImageTk.PhotoImage(img)
+    img_label = tk.Label(anchor_display, image=tk_img)
+    img_label.image = tk_img  # GC 방지
+    img_label.grid(row=0, column=0, padx=(4, 10), pady=(2, 6), sticky="w")  # ← 좌/우 여백 넉넉히
+
+    # 파일명 라벨은 좌측 정렬 + 줄바꿈 허용
+    text_label = tk.Label(anchor_display, text=home_img, font=("맑은 고딕", 10), anchor="w", justify="left")
+    text_label.grid(row=0, column=1, sticky="w")
+
+    update_home_controls_state()  # ← 추가
+
+
+def update_home_controls_state():
+    """우측 헤더의 [등록/변경], [해제] 버튼 상태를 갱신한다."""
+    current_home = get_current_home_image()
+    selected = (selected_image_var.get() or "").strip()
+
+    # 버튼 텍스트: 등록 / 변경
+    anchor_register_btn.config(text=("변경" if current_home else "등록"))
+
+    # 등록/변경 가능 조건: 선택된 이미지가 존재하고, (Home이 없거나 다른 이미지일 때)
+    can_register = bool(selected) and (not current_home or selected != current_home)
+    anchor_register_btn.config(state=("normal" if can_register else "disabled"))
+
+    # 해제 가능 조건: Home이 지정되어 있을 때만
+    anchor_clear_btn.config(state=("normal" if current_home else "disabled"))
+
+
+def on_click_anchor_register():
+    selected = (selected_image_var.get() or "").strip()
+    if not selected:
+        messagebox.showwarning("지정 불가", "먼저 이미지 또는 루틴 항목을 선택하세요.", parent=root)
+        return
+    if is_home_image(selected):
+        # 이미 동일 이미지면 버튼이 비활성이어야 하지만, 가드 한 번 더
+        messagebox.showinfo("알림", "이미 Home으로 등록된 이미지입니다.", parent=root)
+        return
+
+    # 유사도는 선택적으로 함께 저장(없으면 생략)
+    thr = None
+    try:
+        v = conf_var.get()
+        if isinstance(v, str):
+            v = v.strip()
+        thr = float(v)
+    except Exception:
+        pass
+
+    prev = get_current_home_image()
+    save_home_anchor({"image": selected, "threshold": thr})
+
+    update_home_anchor_preview()
+    update_home_controls_state()
+    update_action_menu()
+
+    if prev:
+        messagebox.showinfo("변경 완료",
+                            f"Home 이미지를 '{prev}' → '{selected}'로 변경했습니다.",
+                            parent=root)
+    else:
+        messagebox.showinfo("등록 완료",
+                            f"'{selected}'를 Home으로 등록했습니다.",
+                            parent=root)
+
+
+def on_click_anchor_clear():
+    current = get_current_home_image()
+    if not current:
+        return  # 비활성 상태일 것
+
+    if not messagebox.askyesno(
+        "Home 해제 확인",
+        "Home에 등록된 이미지를 해제하시겠습니까?\n\n"
+        "해제하면 목표달성 모드를 사용할 수 없습니다.",
+        parent=root
+    ):
+        return
+
+    save_home_anchor(None)
+    update_home_anchor_preview()
+    update_home_controls_state()
+    update_action_menu()
+
+    messagebox.showinfo("해제됨", "홈화면 감지용 이미지 지정을 해제했습니다.", parent=root)
+
+
 def update_client_preview():
     for widget in client_display.winfo_children():
         widget.destroy()
@@ -602,6 +781,7 @@ def update_client_preview():
 
 def update_preview():
     update_client_preview()
+    update_home_anchor_preview()  # ← 추가
 
     # 기존 항목 제거
     for widget in preview_frame.winfo_children():
@@ -679,8 +859,11 @@ def select_image(name):
     # 루틴에서 해당 이미지 검색
     match = next((r for r in routine if r['image'] == name), None)
     if match:
-        action_var.set(match['action'])
-        conf_var.set(match['conf'])  # ← 루틴에서 conf 값 로드
+        # 레거시 방어: 'Home'은 액션이 아님 → UI엔 최소 'click'로 강제 표시
+        fallback_action = "click" if match['action'] == "Home" else match['action']
+        action_var.set(fallback_action)
+        # conf는 그대로 로드 (UI 표현용)
+        conf_var.set(match.get('conf', 0.8 if fallback_action != "Client" else 0.9))
     else:
         action_var.set("click")
         conf_var.set(0.8 if action_var.get() != "Client" else 0.9)  # ← 새 이미지 기본값
@@ -688,6 +871,8 @@ def select_image(name):
     sync_conf_entry()  # ← 슬라이더와 입력창 동기화
 
     add_btn.config(state="normal")
+    update_action_menu()
+    update_home_controls_state()  # ← 추가
 
 
 def select_from_routine(index):
@@ -733,12 +918,7 @@ def select_from_routine_by_image(image_name):
 
     select_image(image_name)
 
-    for i, obj in enumerate(action_objects):
-        if obj["value"] == "Client":
-            if any(r['action'] == "Client" and r['image'] != image_name for r in routine):
-                action_menu_btn.menu.entryconfig(i, state="disabled")
-            else:
-                action_menu_btn.menu.entryconfig(i, state="normal")
+    update_action_menu()
 
 
 def update_client_action_menu():
@@ -784,6 +964,11 @@ def add_routine():
         # 이미 다른 이미지가 Client로 설정되어 있으면 추가 불가
         if any(r['action'] == "Client" and r['image'] != selected_image for r in routine):
             messagebox.showwarning("중복 불가", "이미 Client로 설정된 항목이 존재합니다.", parent=root)
+            return
+
+    if action == "Home":
+        if any(r['action'] == "Home" and r['image'] != selected_image for r in routine):
+            messagebox.showwarning("중복 불가", "이미 Home으로 설정된 항목이 있습니다.", parent=root)
             return
 
     if existing:
@@ -841,6 +1026,16 @@ def delete_routine(index):
     global routine_modified
 
     image = routine[index]['image']
+
+    # 🛡 Home 포인터가 이 이미지를 참조 중이면 제외 차단
+    if is_home_image(image):
+        messagebox.showwarning(
+            "제거 불가",
+            "이 이미지는 Home으로 사용 중입니다.\nHome 해제 또는 다른 이미지로 교체한 뒤 제외하세요.",
+            parent=root
+        )
+        return
+
     routine.pop(index)
     for i, r in enumerate(routine):
         r['order'] = i
@@ -848,7 +1043,6 @@ def delete_routine(index):
         image_buttons[image].config(state="normal")
 
     update_client_action_menu()
-
     update_preview()
     update_save_button_state()
 
@@ -858,10 +1052,19 @@ def delete_routine(index):
 def delete_routine_by_image(image_name):
     global routine_modified
 
+    # 🛡 Home 참조 가드
+    if is_home_image(image_name):
+        messagebox.showwarning(
+            "제거 불가",
+            "이 이미지는 Home으로 사용 중입니다.\nHome 해제 또는 다른 이미지로 교체한 뒤 제외하세요.",
+            parent=root
+        )
+        return
+
     index = next((i for i, r in enumerate(routine) if r['image'] == image_name), None)
     if index is not None:
         delete_routine(index)
-        routine_modified = True  # 루틴 변경됨
+        routine_modified = True
 
 
 def save_routine():
@@ -1025,6 +1228,16 @@ def on_closing():
             save_routine()
         # 아니오(False)일 경우 그냥 종료 진행
 
+    # Home 등록이 안 되어 있다면 경고
+    if not is_home_configured():
+        if not messagebox.askyesno(
+                "홈화면 감지용 이미지 등록 안 됨",
+                "홈화면 감지용 이미지가 등록되지 않았습니다.\n\n"
+                "해당 이미지가 없으면 목표달성 모드를 사용할 수 없습니다.\n"
+                "그래도 닫으시겠습니까?",
+                icon="warning"
+        ):
+            return
     remove_lock()  # ✅ config 종료 시 잠금 해제
     root.destroy()
 
@@ -1056,6 +1269,75 @@ def load_action_labels():
         return {}
 
 
+# ---------------------
+# Home 포인터 저장/로드 (home_anchor.json)
+# ---------------------
+
+
+# ---------------------
+# Home 지정/해제 핸들러
+# ---------------------
+def load_home_anchor():
+    """home_anchor.json을 읽어 전역 home_anchor에 로드하고 반환한다."""
+    global home_anchor
+    if os.path.exists(HOME_ANCHOR_FILE):
+        try:
+            with open(HOME_ANCHOR_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "image" in data:
+                home_anchor = data
+            else:
+                home_anchor = None
+        except Exception as e:
+            # 구성 파일 손상 시에도 앱은 계속 열리게 하되, 사용자에게 알림
+            try:
+                messagebox.showerror("Home 포인터 로드 실패",
+                                     f"home_anchor.json 파일을 불러오는 중 오류 발생:\n{e}",
+                                     parent=root)
+            except Exception:
+                pass
+            home_anchor = None
+    else:
+        home_anchor = None
+    return home_anchor
+
+
+def save_home_anchor(data: dict | None):
+    """포인터를 저장한다. None이면 해제(파일 삭제)."""
+    global home_anchor
+    home_anchor = data
+    if data is None:
+        try:
+            if os.path.exists(HOME_ANCHOR_FILE):
+                os.remove(HOME_ANCHOR_FILE)
+        except Exception as e:
+            try:
+                messagebox.showwarning("Home 포인터 삭제 경고",
+                                       f"home_anchor.json 삭제 중 문제가 발생했습니다:\n{e}",
+                                       parent=root)
+            except Exception:
+                pass
+        return
+
+    # 데이터 정규화(키 최소 보장)
+    payload = {"image": data.get("image")}
+    if "threshold" in data and isinstance(data["threshold"], (int, float)):
+        payload["threshold"] = float(data["threshold"])
+
+    with open(HOME_ANCHOR_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def get_current_home_image() -> str | None:
+    """현재 지정된 Home 이미지 파일명(없으면 None)."""
+    return home_anchor.get("image") if home_anchor else None
+
+
+def is_home_image(image_name: str) -> bool:
+    """주어진 파일명이 현재 Home으로 지정돼 있는지."""
+    return bool(home_anchor and home_anchor.get("image") == image_name)
+
+
 # GUI 초기화 및 실행
 
 # ✅ 최초 실행 시 삭제 버튼 상태 강제 초기화
@@ -1064,12 +1346,40 @@ on_action_change()
 # 루틴 로드하기
 load_routine()
 
+
+# 시작 시 포인터 유효성 검사(깨짐 알림)
+def validate_home_anchor_on_startup():
+    img = get_current_home_image()
+    if not img:
+        return
+    p = os.path.join(image_folder, img)
+    if not os.path.exists(p):
+        # 자동 해제
+        save_home_anchor(None)
+        update_home_anchor_preview()
+        update_home_controls_state()
+        messagebox.showwarning(
+            "Home 해제됨",
+            "등록된 Home 이미지 파일을 찾을 수 없어 할당을 해제했습니다.\n"
+            "다시 등록해 주세요.",
+            parent=root
+        )
+
+
+# Home 포인터 로드하기
+home_anchor = load_home_anchor()
+validate_home_anchor_on_startup()
+update_home_controls_state()   # ← 추가
+# 🔧 프리뷰도 즉시 갱신 (중요)
+update_home_anchor_preview()
+
 # action 라벨 로드하기
 # 사용자 정의 label 불러오기
 label_map = load_action_labels()
 for obj in action_objects:
     if obj["value"] in label_map:
         obj["label"] = label_map[obj["value"]]
+update_action_menu()   # ← 라벨 반영 + Home 제외 상태로 메뉴 재생성
 
 # 바인딩
 preview_canvas.bind("<MouseWheel>", on_mousewheel)
@@ -1078,6 +1388,8 @@ conf_var.trace_add("write", sync_conf_entry)
 action_var.trace_add("write", on_action_change)
 conf_entry.bind("<Return>", sync_conf_slider)
 conf_entry.bind("<FocusOut>", sync_conf_slider)
+anchor_register_btn.config(command=on_click_anchor_register)
+anchor_clear_btn.config(command=on_click_anchor_clear)
 
 # 메인 실행
 root.protocol("WM_DELETE_WINDOW", on_closing)

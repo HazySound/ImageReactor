@@ -1,0 +1,119 @@
+{
+  "gui": {
+    "idle_alpha": 0.35,
+    "hover_alpha": 1.0,
+    "topmost": true,
+    "auto_compact_on_start": true,
+    "remember_position": true,
+    "_last_geometry": "640x400+86+106"
+  },
+  "safety": {
+    "stop_longpress_ms": 1200
+  },
+  "email": {
+    "enabled": false,
+    "provider": "gmail",
+    "smtp_host": "",
+    "smtp_port": 587,
+    "use_tls": true,
+    "sender": "fcmining.notice@gmail.com",
+    "app_password": "rbff grxh odhg edch",
+    "recipients": "cemigs1@gmail.com",
+    "subject_tmpl": "[자동 이메일 테스트]",
+    "body_tmpl": "테스트용 메일입니다",
+    "events": {
+      "goal_achieved": {
+        "enabled": true
+      },
+      "client_crashed": {
+        "enabled": true
+      },
+      "freeze_detected": {
+        "enabled": true
+      }
+    },
+    "templates": {
+      "goal_achieved": {
+        "subject": "목표 달성!",
+        "body": "목표달성 테스트"
+      },
+      "client_crashed": {
+        "subject": "클라 튕김!",
+        "body": "클라 튕김 테스트"
+      },
+      "freeze_detected": {
+        "subject": "게임 멈춤!",
+        "body": "게임 멈춤 테스트"
+      }
+    },
+    "defaults": {
+      "goal_achieved": {
+        "subject": "[FC온라인] 목표 달성",
+        "body": "목표 달성 감지\n모드={mode}, rank={rank}, points={points}\n프리셋={preset_id}\n시각={timestamp}\n호스트={hostname}"
+      },
+      "client_crashed": {
+        "subject": "[FC온라인] 클라이언트 아이콘 소실/중단",
+        "body": "클라이언트 아이콘 소실 감지\n이미지={image}\n시각={timestamp}\n호스트={hostname}"
+      },
+      "freeze_detected": {
+        "subject": "[FC온라인] 프리즈 감지",
+        "body": "프리즈 감지\n연속 정지 탐지 임계 초과\n시각={timestamp}\n호스트={hostname}"
+      }
+    },
+    "rate_limit_max": 3,
+    "rate_limit_window_sec": 300
+  },
+  "hotkeys": {
+    "start": "F9",
+    "stop": "F12",
+    "toggle_compact": "F10",
+    "calibration": "F8"
+  },
+  "profiles": {},
+  "goal": {
+    "enabled": true,
+    "active_preset_id": "p1",
+    "presets": {
+      "p1": {
+        "name": "TOP 20~25",
+        "mode": "rank",
+        "rank_target": 20,
+        "rank_tolerance": 5,
+        "points_target": 0,
+        "points_margin": 0,
+        "type": "rank"
+      },
+      "p2": {
+        "name": "TOP 200",
+        "mode": "rank",
+        "rank_target": 200,
+        "rank_tolerance": 0,
+        "points_target": 0,
+        "points_margin": 0,
+        "type": "rank"
+      }
+    },
+    "confirm_samples": 3,
+    "confirm_window_ms": 1500
+  },
+  "ocr": {
+    "roi_rank": [
+      1136,
+      568,
+      153,
+      57
+    ],
+    "roi_score": null,
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "roi_points": [
+      837,
+      567,
+      144,
+      60
+    ],
+    "screen": {
+      "w": 2560,
+      "h": 1440
+    }
+  }
+}
