@@ -68,7 +68,7 @@ def _is_subsequence(sub: str, base: str) -> bool:
 
 def _match_out_of_range_ko(text: str) -> bool:
     """
-    '순위권 이탈'을 부분적으로라도 인식했는지 판단.
+    '순위권 이탈(임시 텍스트. 추후 변경 필요)'을 부분적으로라도 인식했는지 판단.
     허용 규칙:
       - 공백/개행/기호 제거 후 정확 부분문자열이거나
       - '순위권이탈'의 subsequence(순서 유지, 일부 누락 허용)
@@ -475,7 +475,6 @@ def preprocess_text(pil_img, upscale: float = 1.5):
 
 def parse_rank_text(text: str):
     raw = _normalize_spaces(text)
-    # "순위권 이탈" 검출(공백 정규화 후 부분일치)
     if _match_out_of_range_ko(raw):
         return {"value": None, "raw": raw, "kind": "rank", "state": "OUT_OF_RANGE"}
 

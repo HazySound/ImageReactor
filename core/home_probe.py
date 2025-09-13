@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import time
 from typing import Optional, Literal, Dict, Any, Tuple
-import json
-import os
+import os, json, unicodedata
 
 # 인터페이스 요구:
 # - capture(): ndarray (현재 프레임) — 1회 캡처는 외부에서 호출해 전달
@@ -178,29 +177,36 @@ def _now_ms() -> int:
 
 def get_home_anchor_template(image_folder: str, routine: list) -> Optional[str]:
     """
-    프로젝트 루트(코드 파일 위치)의 home_anchor.json에서 image 이름을 읽어
-    image_folder/<image> 경로를 반환한다. (routine은 무시/호환용)
-    - 포인터가 없거나 무효, 혹은 실제 이미지가 없으면 None 반환.
+    CWD(= exe 폴더) 기준의 home_anchor.json을 읽어 템플릿 파일명을 얻고,
+    image_folder/<파일명> 경로(상대경로)를 만들어 반환한다.
+    - path_manager.chdir_to_base()로 CWD가 이미 exe 폴더로 고정되어 있다는 전제를 따른다.
+    - 파일명만 사용(디렉터리 무시), 유니코드/대소문자 정규화.
     """
     try:
-        # core/ 하위 모듈 기준으로 프로젝트 루트 계산
-        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        ptr_path = os.path.join(root_dir, "home_anchor.json")
-
+        # 1) 포인터 파일: 현재 작업 디렉터리에서 직접 찾음 (exe 옆)
+        ptr_path = os.path.join(os.getcwd(), "home_anchor.json")
         if not os.path.exists(ptr_path):
             return None
 
         with open(ptr_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = json.load(f) or {}
 
-        img_name = (data or {}).get("image")
-        if not img_name or not isinstance(img_name, str):
+        # 2) 파일명만 추출 + 정규화
+        raw = str(data.get("image", "")).strip()
+        if not raw:
             return None
+        name = os.path.basename(raw)                      # 디렉터리 제거
+        name = unicodedata.normalize("NFC", name).lower() # 유니코드/소문자 정규화
 
-        tpl_path = os.path.join(image_folder, img_name)
+        # 3) image_folder와 결합 (image_folder는 상대경로일 수 있음)
+        #    - path_manager.chdir_to_base()가 선행되어 있으므로 상대경로 → exe 옆으로 수렴
+        #    - image_folder 끝 슬래시 유무와 무관하게 안전 결합
+        folder = str(image_folder or "").rstrip("\\/")
+        tpl_path = os.path.join(folder, name)
+
+        # 4) 존재 확인 후 반환
         return tpl_path if os.path.exists(tpl_path) else None
 
     except Exception as e:
-        # 읽기/파싱 문제는 None 처리(로그만 남김)
-        print(f"[HOME] home_anchor.json 읽기 오류: {e}")
+        print(f"[HOME] home_anchor.json 읽기/해석 실패: {e}")
         return None

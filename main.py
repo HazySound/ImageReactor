@@ -1091,6 +1091,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                     if res == "hit":
                         if freeze is not None:
                             freeze.deactivate()
+                        _home_ff_limiter_reset()
                         # ---- 최초 1회 커밋: 파일 캐시가 비어 있으면 방금 매칭한 bbox로 커밋 ----
                         if _CACHED_ROI is None and _HOME_TPL_PATH is not None and _HOME_SCREEN_WH is not None:
                             last_bbox = probe.get_last_bbox() if probe else None
@@ -1235,6 +1236,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         # [ADD] settle 가드 리셋
                         _AWAIT_ENTER_MS = None
                         _AWAIT_SETTLE_MS = 1200
+
+                        _home_ff_limiter_reset()
 
                     elif res == "miss":
                         # [DEBUG] Home화면 인식 실패

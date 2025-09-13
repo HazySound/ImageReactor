@@ -1,2 +1,6 @@
-pyinstaller --onefile --noconsole --icon=resources\icon\icon.ico --add-data "assets;assets" --name ImageReactor gui_main.py
+pyinstaller --onefile --noconsole --icon=resources\icon\icon.ico --name ImageReactor gui_main.py
 pyinstaller --onefile --noconsole --icon=resources\icon\config.ico --name Config config.py
+
+
+
+pyinstaller --onefile --icon=resources\icon\icon.ico --name ImageReactor gui_main.py

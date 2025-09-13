@@ -8,6 +8,8 @@ import mss
 import customtkinter as ctk
 import cv2
 import numpy as np
+import gc
+import time
 from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 import autoemail
 from control_bus import start_event, stop_event
@@ -110,12 +112,36 @@ class OverlayApp(ctk.CTk):
             pass
 
         # 알파(포인터 따라 투명도)
-        self.idle_alpha = float(self.settings.get("gui.idle_alpha", 0.35))
-        self.hover_alpha = float(self.settings.get("gui.hover_alpha", 1.0))
-        self.attributes("-alpha", self.idle_alpha)
-        self._alpha_state = "idle"
-        self._alpha_track_enabled = True  # ← 추가
-        self.after(300, self._track_pointer_alpha)
+        self.opacity = float(self.settings.get("ui.opacity", 1.0))
+        self._alpha_state = "manual"
+        self._alpha_track_enabled = False  # ← 기본 off
+        self._current_opacity = max(0.35, min(1.0, self.opacity))
+
+        # ★ 누락 필드 보강: 트래킹 로직이 참조하는 값
+        # ── Event-driven alpha settings ──
+        self._ALPHA_ENTER_IMMEDIATE = True  # Enter 즉시 1.0
+        self._ALPHA_LEAVE_DELAY_MS = 120  # Leave 후 지연 적용
+        self._ALPHA_BORDER_INSET_PX = 6  # 경계 히스테리시스(공간)
+
+        self._alpha_evt_enabled = True  # 이벤트 드리븐 on/off
+        self._alpha_inside = False  # 현재 포인터가 창 내부로 판정되었는지
+        self._alpha_leave_deadline_ms = 0  # Leave 지연 데드라인(ms)
+        self._alpha_leave_after_id = None  # 단일 after 핸들
+
+        self.idle_alpha = float(self._current_opacity)
+        self.hover_alpha = 1.0
+
+        # layered 적용 여부 추적(마지막으로 attributes로 적용한 값)
+        self._last_attr_alpha = None
+        if self._current_opacity < 0.999:
+            try:
+                self.attributes("-alpha", float(self._current_opacity))
+                self._last_attr_alpha = float(self._current_opacity)  # ★추가
+            except Exception:
+                pass
+
+        self._alpha_temp_elevated = False  # busy 동안 임시 1.0 승격 여부
+        self._alpha_restore_value = None  # 복귀용 값
 
         self._last_toggle_ms = 0
 
@@ -125,11 +151,18 @@ class OverlayApp(ctk.CTk):
         self._build_ui()
         self._init_goal_ui_bindings()
 
+        # ── 단일 UI 틱 설정 ──
+        self._TICK_MS = 250  # 250~300ms 권장
+        self._ui_tick_guard = False  # 재진입 방지
+        # 폴링 예약 핸들(없으면 None)
+        self._poll_after_id = None
+
         # [ADD] 시작 시 마지막 상태 복원에 따른 시각/로그 반영
         self._sync_goal_visual()
         self._log_startup_goal_and_hotkey()
 
-        self.after(100, self._poll_controller)
+        # 다음 틱 예약(단일 루프)
+        self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
         self._log_gui(f"해상도 : {self.winfo_screenwidth()} X {self.winfo_screenheight()}")
 
         geo = self.settings.get("gui._last_geometry")
@@ -156,7 +189,26 @@ class OverlayApp(ctk.CTk):
         self.bind("<ButtonPress-1>", lambda e: self._ui_busy_set(True))
         self.bind("<B1-Motion>", lambda e: self._ui_busy_set(True))
         self.bind("<ButtonRelease-1>", lambda e: self._ui_busy_set(False))
-        self.bind("<Configure>", lambda e: self._ui_busy_set(True))  # 리사이즈/이동 이벤트
+
+        self._gc_was_enabled = True
+
+        # busy OFF 데드라인/체커
+        self._ui_busy_deadline_ms = 0
+        self._ui_busy_off_checker_id = None
+
+        # 리사이즈/이동은 디바운스된 핸들러로 교체
+        self.bind("<Configure>", self._on_root_configure)
+
+        # 최상위 기준으로만 Enter/Leave 처리(자식 위젯 간 이동 오발 방지)
+        self.bind("<Enter>", self._on_win_enter, add="+")
+        self.bind("<Leave>", self._on_win_leave, add="+")
+
+        self._cfg_after = None  # 디바운스 핸들러용 타이머 핸들
+        # Windows에서 이동/리사이즈 시작/종료를 정확히 잡아내는 훅
+        try:
+            self._install_win32_movesize_hooks()
+        except Exception:
+            pass
 
         # 전역 핫키 등록: 게임 포커스 상태에서도 F9/F12/ESC가 동작하도록
         try:
@@ -277,6 +329,7 @@ class OverlayApp(ctk.CTk):
         self.bottom = ctk.CTkFrame(self, fg_color=THEME["PANEL_BG"])
         self.bottom.pack(fill="x", padx=padx, pady=(0, 10))
 
+        # === 좌측 컨트롤 ===
         left_controls = ctk.CTkFrame(self.bottom, fg_color="transparent")
         left_controls.pack(side="left")
         self.btn_roi = ctk.CTkButton(left_controls, text="좌표 설정", width=120, height=36, command=self._open_roi_editor)
@@ -287,6 +340,25 @@ class OverlayApp(ctk.CTk):
         # [ADD] 좌표 유무에 따라 '좌표 확인' 초기 상태 반영
         self._update_calib_buttons_state()
 
+        # ── 중간: 투명도 슬라이더 ─────────────────────────────────
+        alpha_controls = ctk.CTkFrame(self.bottom, fg_color="transparent")
+        alpha_controls.pack(side="left", padx=8)
+
+        ctk.CTkLabel(alpha_controls, text="불투명도", width=0).pack(side="left", padx=(2, 6))
+        self.alpha_slider = ctk.CTkSlider(
+            alpha_controls,
+            from_=0.35, to=1.0,
+            number_of_steps=65,  # 0.01 단위 체감
+            width=180,
+            command=self._on_opacity_drag
+        )
+        self.alpha_slider.set(getattr(self, "_current_opacity", 1.0))
+        self.alpha_slider.pack(side="left")
+
+        # 드래그 종료 시 확정 적용(전환 최소화)
+        self.alpha_slider.bind("<ButtonRelease-1>", self._on_opacity_release)
+
+        # === 우측 컨트롤 ===
         right_controls = ctk.CTkFrame(self.bottom, fg_color=THEME["PANEL_BG"])
         right_controls.pack(side="right")
         img_play = os.path.join(str(ASSETS_DIR), "play.png")
@@ -315,6 +387,186 @@ class OverlayApp(ctk.CTk):
     # ------------------------------------------------------------------
     # 상태/알파
     # ------------------------------------------------------------------
+    # --- Opacity helpers (최소 비용) ---
+    def _on_opacity_drag(self, val):
+        # 드래그 중엔 미리보기만 (layered 전환 최소화)
+        try:
+            v = max(0.35, min(1.0, float(val)))
+        except Exception:
+            return
+        self._current_opacity = v
+        self.idle_alpha = float(v)
+        # 창 밖(idle)일 때만 미리 반영, 안에 있으면 1.0 유지
+        if not getattr(self, "_alpha_inside", False):
+            self._apply_alpha_idle()
+
+    def _on_opacity_release(self, _evt=None):
+        v = float(getattr(self, "_current_opacity", 1.0))
+        self.idle_alpha = float(v)
+        # 상태에 따라 최종 적용
+        if getattr(self, "_alpha_inside", False):
+            self._apply_alpha_hover()
+        else:
+            self._apply_alpha_idle()
+
+        # settings.json 저장
+        try:
+            self.settings.set("ui.opacity", float(v))
+            self.settings.save()
+        except Exception:
+            pass
+
+    def _on_root_configure(self, _e=None):
+        # 즉시 busy ON
+        try:
+            self._ui_busy_set(True)
+        except Exception:
+            pass
+
+    def _is_effectively_one(self, v: float, eps: float = 1e-3) -> bool:
+        try:
+            return abs(float(v) - 1.0) <= eps
+        except Exception:
+            return False
+
+    def _is_pointer_inside_window_precise(self, event=None) -> bool:
+        """최상위 기준 내부 판정(경계 히스테리시스 포함). 자식 위젯 간 이동 오발 제거."""
+        try:
+            rx, ry = self.winfo_rootx(), self.winfo_rooty()
+            rw, rh = self.winfo_width(), self.winfo_height()
+            inset = int(getattr(self, "_ALPHA_BORDER_INSET_PX", 0))
+            x0, y0 = rx + inset, ry + inset
+            x1, y1 = rx + rw - inset, ry + rh - inset
+            if event is not None and hasattr(event, "x_root") and hasattr(event, "y_root"):
+                xr, yr = int(event.x_root), int(event.y_root)
+            else:
+                xr, yr = self.winfo_pointerx(), self.winfo_pointery()
+            return (x0 <= xr < x1) and (y0 <= yr < y1)
+        except Exception:
+            return False
+
+    def _set_alpha_if_needed(self, v: float, *, update_idle: bool = False) -> None:
+        """
+        동일값이면 호출 생략.
+        - update_idle=True일 때만 idle_alpha를 갱신한다(hover에서는 절대 갱신 금지).
+        - v>=1.0로 올릴 때, 창이 layered(<1.0 적용 경험) 상태면 1.0을 실제로 한 번 적용해 non-layered로 복귀시킨다.
+        """
+        try:
+            v = float(v)
+        except Exception:
+            return
+        v = max(0.35, min(1.0, v))
+
+        cur = float(getattr(self, "_current_opacity", 1.0))
+        # 1.0 승격(레거시 layered→non-layered 복귀)이 필요한 경우를 예외로 하여 스킵 판단
+        if abs(cur - v) <= 1e-3 and not (v >= 0.999 and getattr(self, "_last_attr_alpha", None) is not None):
+            return
+
+        self._current_opacity = v
+        if update_idle:
+            self.idle_alpha = float(v)
+
+        # busy/드래그/리사이즈 중엔 변경 금지
+        try:
+            if get_state_store().is_ui_busy():
+                return
+        except Exception:
+            pass
+
+        try:
+            if v >= 0.999:
+                # layered→non-layered 복귀가 필요하면 1.0 한 번 실제 적용
+                if getattr(self, "_last_attr_alpha", None) is not None:
+                    self.attributes("-alpha", 1.0)
+                    self._last_attr_alpha = None
+                return  # 이미 non-layered면 호출 생략
+            # v < 1.0: layered 적용
+            self.attributes("-alpha", v)
+            self._last_attr_alpha = v
+        except Exception:
+            pass
+
+    def _apply_alpha_hover(self):
+        self._set_alpha_if_needed(1.0, update_idle=False)  # ★ hover는 idle_alpha 건드리지 않음
+
+    def _apply_alpha_idle(self):
+        self._set_alpha_if_needed(float(getattr(self, "idle_alpha", getattr(self, "_current_opacity", 1.0))),
+                                  update_idle=False)
+
+    def _on_win_enter(self, event=None):
+        if not getattr(self, "_alpha_evt_enabled", True):
+            return
+        try:
+            if get_state_store().is_ui_busy():
+                return
+        except Exception:
+            pass
+
+        if not self._is_pointer_inside_window_precise(event):
+            return  # 자식→자식 이동 등 무시
+
+        self._alpha_inside = True
+        # Leave 지연 타이머가 있으면 취소
+        aid = getattr(self, "_alpha_leave_after_id", None)
+        if aid:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            self._alpha_leave_after_id = None
+
+        if getattr(self, "_ALPHA_ENTER_IMMEDIATE", True):
+            self._apply_alpha_hover()
+
+    def _on_win_leave(self, event=None):
+        if not getattr(self, "_alpha_evt_enabled", True):
+            return
+
+        actually_out = not self._is_pointer_inside_window_precise(event)
+        if not actually_out:
+            return
+        self._alpha_inside = False
+
+        import time
+        self._alpha_leave_deadline_ms = int(time.time() * 1000) + int(getattr(self, "_ALPHA_LEAVE_DELAY_MS", 120))
+
+        if getattr(self, "_alpha_leave_after_id", None) is None:
+            def _check():
+                self._alpha_leave_after_id = None
+
+                # busy면 조금 뒤 다시 체크
+                try:
+                    if get_state_store().is_ui_busy():
+                        self._alpha_leave_after_id = self.after(getattr(self, "_ALPHA_LEAVE_DELAY_MS", 120), _check)
+                        return
+                except Exception:
+                    pass
+
+                import time as _t
+                now = int(_t.time() * 1000)
+                if (now < self._alpha_leave_deadline_ms) or self._is_pointer_inside_window_precise(None):
+                    self._alpha_leave_after_id = self.after(60, _check)
+                    return
+
+                self._apply_alpha_idle()
+
+            self._alpha_leave_after_id = self.after(getattr(self, "_ALPHA_LEAVE_DELAY_MS", 120), _check)
+
+    def _apply_opacity(self, v: float) -> None:
+        v = max(0.35, min(1.0, float(v)))
+        # 외부에서 'idle 목표'를 명시적으로 바꿀 때만 사용
+        self._set_alpha_if_needed(v, update_idle=True)
+
+    def _force_non_layered_refresh(self) -> None:
+        """layered→non-layered 복귀 보장 (희귀 케이스용)."""
+        try:
+            # 1) 알파 호출 금지 상태에서
+            # 2) 가볍게 withdraw/deiconify로 스타일 재적용
+            self.withdraw()
+            self.deiconify()
+        except Exception:
+            pass
+
     def _toggle_mode(self):
         self._expanded = not self._expanded
         self._apply_expanded_state()
@@ -374,60 +626,180 @@ class OverlayApp(ctk.CTk):
             self.toggle_btn.configure(text="버튼 표시")
             self.mode_var.set("compact")
 
-    def _pointer_in_window(self) -> bool:
-        try:
-            x, y = self.winfo_pointerxy()
-            rx, ry = self.winfo_rootx(), self.winfo_rooty()
-            rw, rh = self.winfo_width(), self.winfo_height()
-            return (rx <= x <= rx + rw) and (ry <= y <= ry + rh)
-        except Exception:
-            return False
-
     def _ui_busy_set(self, busy: bool):
         """창 이동/리사이즈 등 사용자가 GUI를 만지는 동안 heavy 작업을 늦추기 위한 플래그."""
         store = get_state_store()
+
         if busy:
-            # 즉시 busy ON + 알파 트래킹 일시 정지
+            # 즉시 busy ON
             try:
                 store.set_ui_busy(True)
+                # GC 일시 정지
+                try:
+                    self._gc_was_enabled = gc.isenabled()
+                    if self._gc_was_enabled:
+                        gc.disable()
+                except Exception:
+                    pass
             except Exception:
                 pass
             self._alpha_paused = True
-            # 드래그/리사이즈가 잠깐 멈추면 250ms 뒤 busy 해제
-            if self._ui_busy_debounce:
+
+            # 220ms 뒤까지 ‘조용하면’ busy를 끈다 → 매 이벤트마다 데드라인만 갱신
+            now = int(time.time() * 1000)
+            self._ui_busy_deadline_ms = now + 300
+
+            # busy 동안 폴링 완전 정지: 예약되어 있으면 취소
+            if getattr(self, "_poll_after_id", None):
                 try:
-                    self.after_cancel(self._ui_busy_debounce)
+                    self.after_cancel(self._poll_after_id)
                 except Exception:
                     pass
-            self._ui_busy_debounce = self.after(350, lambda: self._ui_busy_set(False))
+                self._poll_after_id = None
+
+            # goal_ui 폴러도 일시 정지
+            if getattr(self, "_goal_ui_after_id", None):
+                try:
+                    self.after_cancel(self._goal_ui_after_id)
+                except Exception:
+                    pass
+                self._goal_ui_after_id = None
+
+            # layered → non-layered 임시 승격 (딱 1회)
+            try:
+                v = float(getattr(self, "_current_opacity", 1.0))
+                if (v < 0.999) and (not self._alpha_temp_elevated):
+                    self._alpha_restore_value = v
+                    self.attributes("-alpha", 1.0)
+                    self._last_attr_alpha = None  # ★추가: 이제 non-layered
+                    self._alpha_temp_elevated = True
+            except Exception:
+                pass
+
+            # 체크 루프가 없으면 하나만 띄운다 (취소/재예약 없음)
+            if not self._ui_busy_off_checker_id:
+                def _check():
+                    self._ui_busy_off_checker_id = None
+                    try:
+                        cur = int(time.time() * 1000)
+                        if cur >= self._ui_busy_deadline_ms:
+                            # busy OFF 확정 → 폴링 1회만 재개
+                            if getattr(self, "_poll_after_id", None) is None:
+                                try:
+                                    self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
+                                except Exception:
+                                    self._poll_after_id = None
+
+                            # OFF 확정
+                            try:
+                                store.set_ui_busy(False)
+                                # goal_ui 폴러 재개(중복 예약 방지)
+                                if getattr(self, "_goal_ui_after_id", None) is None:
+                                    try:
+                                        self._goal_ui_after_id = self.after(300, self._goal_ui_poll)
+                                    except Exception:
+                                        self._goal_ui_after_id = None
+
+                                # GC 복구 + 즉시 수거(짧게)
+                                try:
+                                    if not gc.isenabled() and self._gc_was_enabled:
+                                        gc.enable()
+                                    gc.collect(0)
+                                    gc.collect(1)
+                                except Exception:
+                                    pass
+
+                                # 임시 승격 복구
+                                try:
+                                    if self._alpha_temp_elevated:
+                                        self._alpha_temp_elevated = False
+                                        rv = self._alpha_restore_value
+                                        self._alpha_restore_value = None
+                                        if isinstance(rv, (int, float)) and rv < 0.999:
+                                            self.attributes("-alpha", float(rv))
+                                            self._last_attr_alpha = float(rv)  # ★추가: layered 복귀
+                                        else:
+                                            self.attributes("-alpha", 1.0)
+                                            self._last_attr_alpha = None  # ★추가: non-layered
+                                except Exception:
+                                    pass
+
+                            except Exception:
+                                pass
+                            self._alpha_paused = False
+                            # layered 임시해제 복구는 패치 B에서 처리
+                            return
+                    except Exception:
+                        pass
+                    # 아직 데드라인 안 지남 → 조금 뒤 다시 확인
+                    try:
+                        self._ui_busy_off_checker_id = self.after(120, _check)
+                    except Exception:
+                        pass
+
+                self._ui_busy_off_checker_id = self.after(120, _check)
         else:
-            # debounce 타이머가 해제 타이밍에만 온다
+            # 외부에서 강제 OFF 요청 시(드물지만) 깔끔히 종료
             try:
                 store.set_ui_busy(False)
             except Exception:
                 pass
             self._alpha_paused = False
-            self._ui_busy_debounce = None
+            if self._ui_busy_off_checker_id:
+                try:
+                    self.after_cancel(self._ui_busy_off_checker_id)
+                except Exception:
+                    pass
+                self._ui_busy_off_checker_id = None
+
+    def _install_win32_movesize_hooks(self):
+        import sys
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        GWL_WNDPROC = -4
+        WM_ENTERSIZEMOVE = 0x0231
+        WM_EXITSIZEMOVE = 0x0232
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
+        hwnd = wintypes.HWND(self.winfo_id())
+
+        # 원래 WNDPROC 저장
+        orig_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+        # 콜백이 GC되지 않도록 보관
+        self._wndproc_ref = None
+
+        @WNDPROC
+        def _proc(hWnd, msg, wParam, lParam):
+            try:
+                if msg == WM_ENTERSIZEMOVE:
+                    # 이동/리사이즈 시작: busy ON (주기 작업/알파 임시 승격 등은 내부에서 처리)
+                    try:
+                        self._ui_busy_set(True)
+                    except Exception:
+                        pass
+                elif msg == WM_EXITSIZEMOVE:
+                    # 이동/리사이즈 종료: busy OFF (내부 데드라인/복구 로직이 있으므로 즉시 OFF 신호만)
+                    try:
+                        self._ui_busy_set(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # 원래 WNDPROC 호출
+            return ctypes.c_long(user32.CallWindowProcW(orig_proc, hWnd, msg, wParam, lParam))
+
+        # 후킹
+        self._wndproc_ref = _proc
+        user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, ctypes.cast(_proc, ctypes.c_void_p).value)
 
     def _track_pointer_alpha(self):
-        # 보조창이 떠 있는 동안은 아예 멈춤
-        if not getattr(self, "_alpha_track_enabled", True):
-            return
-
-        # ★ 드래그/리사이즈 중에는 알파 갱신 자체를 잠시 멈춰 compositor 부하 감소
-        if getattr(self, "_alpha_paused", False):
-            self.after(300, self._track_pointer_alpha)
-            return
-
-        inside = self._pointer_in_window()
-        if inside and self._alpha_state != "hover":
-            self.attributes("-alpha", self.hover_alpha)
-            self._alpha_state = "hover"
-        elif not inside and self._alpha_state != "idle":
-            self.attributes("-alpha", self.idle_alpha)
-            self._alpha_state = "idle"
-        self.after(300, self._track_pointer_alpha)  # ★ 60→180ms: 갱신부담 완화
-        self._alpha_paused = False
+        """[DEPRECATED] 이벤트 드리븐으로 대체됨. 호환용 더미."""
+        return
 
     # ------------------------------------------------------------------
     # 알파 트래킹 제어 (다이얼로그가 떠있는 동안 일시 정지용)
@@ -438,27 +810,26 @@ class OverlayApp(ctk.CTk):
         off: 루프를 즉시 정지시킨다(다음 after 예약 없음).
         on : 루프를 재가동시킨다(한 번 킥해서 after 체인을 복원).
         """
-        try:
-            self._alpha_track_enabled = bool(enabled)
-        except Exception:
-            self._alpha_track_enabled = True
+        self._alpha_evt_enabled = bool(enabled)
 
-        if self._alpha_track_enabled:
-            # 루프가 return으로 끊긴 상태라면 한 번 킥해준다.
+        # Leave 지연 타이머 정리
+        aid = getattr(self, "_alpha_leave_after_id", None)
+        if aid:
             try:
-                # 50ms 뒤 재개: 현재 포인터 위치/상태를 즉시 반영
-                self.after(50, self._track_pointer_alpha)
+                self.after_cancel(aid)
             except Exception:
                 pass
-        else:
-            # 끌 때는 현재 상태에 맞춘 알파만 세팅해두고, 루프는 정지
-            try:
-                if getattr(self, "_alpha_state", "idle") == "hover":
-                    self.attributes("-alpha", float(self.hover_alpha))
+        self._alpha_leave_after_id = None
+
+        # 현재 상태에 맞춰 1회만 반영
+        try:
+            if self._alpha_evt_enabled:
+                if self._is_pointer_inside_window_precise(None):
+                    self._apply_alpha_hover()
                 else:
-                    self.attributes("-alpha", float(self.idle_alpha))
-            except Exception:
-                pass
+                    self._apply_alpha_idle()
+        except Exception:
+            pass
 
     def _load_icon(self, filename: str, size: int = 18):
         path = os.path.join(ASSETS_DIR, filename)
@@ -508,25 +879,55 @@ class OverlayApp(ctk.CTk):
         self.stop_hold.set_running(False)
 
     def _poll_controller(self):
-        s = self.controller.poll_state()
-        if s:
-            # 표시는 IDLE/ RUNNING 두 가지만 유지
-            disp = "IDLE" if s == "IDLE" else "RUNNING"
-            self.state_var.set(disp)
-            self._set_state_color(disp)
+        # ── 재진입 가드 ──
+        if getattr(self, "_ui_tick_guard", False):
+            return
+        self._ui_tick_guard = True
+        try:
+            # ── 사용자 상호작용/비가시/최소화면이면 이번 틱은 스킵 ──
+            try:
+                from core.state_store import get_state_store
+                if get_state_store().is_ui_busy():
+                    return
+            except Exception:
+                pass
+            if (not self.winfo_viewable()) or (self.state() == "iconic"):
+                return
 
-            # 버튼 상태도 표시 기준으로만 결정
-            runningish = (disp == "RUNNING")
-            self.stop_hold.set_running(runningish)
+            s = self.controller.poll_state()
+            if s:
+                disp = "IDLE" if s == "IDLE" else "RUNNING"
+                if disp != getattr(self, "_last_state_disp", None):
+                    self.state_var.set(disp)
+                    self._set_state_color(disp)
+                    self._last_state_disp = disp
+                    self.stop_hold.set_running(disp == "RUNNING")
 
-        ln = self.controller.poll_log()
-        if ln:
-            self.log.configure(state="normal")
-            self.log.insert("end", ln + "\n", ("base",))  # ★ 기본 폰트 태그 강제
-            self.log.see("end")
-            self.log.configure(state="disabled")
+            # 가능하면 여러 줄을 모아서 1회 삽입
+            tick_budget_ms = 3.0  # 틱당 최대 3ms만 소비 (필요시 2~5 조정)
+            t0 = time.perf_counter()
+            lines = []
+            MAX_LINES = 50  # 한 틱당 최대 50줄만
+            while len(lines) < MAX_LINES:
+                ln = self.controller.poll_log()
+                if not ln:
+                    break
+                lines.append(ln)
+                if (time.perf_counter() - t0) * 1000.0 >= tick_budget_ms:
+                    break  # 이번 틱은 여기까지, 나머지는 다음 틱에서
 
-        self.after(100, self._poll_controller)
+            if lines:
+                buf = "".join(l + "\n" for l in lines)
+                self.log.configure(state="normal")
+                self.log.insert("end", buf, ("base",))
+                self.log.see("end")
+                self.log.configure(state="disabled")
+        finally:
+            self._ui_tick_guard = False
+            try:
+                self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
+            except Exception:
+                self._poll_after_id = None
 
     def _log_gui(self, s: str) -> None:
         def _do():
@@ -599,28 +1000,47 @@ class OverlayApp(ctk.CTk):
         self._goal_ui_poll()
 
     def _goal_ui_poll(self):
-        active = get_state_store().is_ocr_sampling_active()
-        self._set_goal_controls_enabled(not active)
-
-        # --- 상태 전이 감지 ---
-        prev = getattr(self, "_ocr_auto_overlay_last", False)
-        if active and not prev:
-            # False -> True : OCR 캡처 시작 → 메인 GUI 완전 숨김
+        if getattr(self, "_goal_ui_guard", False):
+            return
+        self._goal_ui_guard = True
+        try:
+            # 사용자 조작 중이면만 스킵 (비가시는 일부만 스킵)
             try:
-                self._ocr_auto_overlay_ctx = self._enter_overlay_mode(keep_goal_poll=True)  # withdraw + 주기작업 일시정지
+                if get_state_store().is_ui_busy():
+                    return
             except Exception:
-                self._ocr_auto_overlay_ctx = None
-        elif (not active) and prev:
-            # True -> False : OCR 캡처 종료 → 복귀
+                pass
+
+            viewable = bool(self.winfo_viewable())
+            iconic = (self.state() == "iconic")
+            # 최소화(iconic) 상태만 즉시 종료. withdrawn(비가시)라도 복귀 신호는 처리해야 함.
+            if iconic:
+                return
+
+            active = get_state_store().is_ocr_sampling_active()
+
+            self._set_goal_controls_enabled(not active)
+
+            prev = getattr(self, "_ocr_auto_overlay_last", False)
+            if active and not prev:
+                try:
+                    self._ocr_auto_overlay_ctx = self._enter_overlay_mode(keep_goal_poll=True)
+                except Exception:
+                    self._ocr_auto_overlay_ctx = None
+            elif (not active) and prev:
+                try:
+                    self._leave_overlay_mode(self._ocr_auto_overlay_ctx)
+                finally:
+                    self._ocr_auto_overlay_ctx = None
+
+            self._ocr_auto_overlay_last = bool(active)
+        finally:
+            self._goal_ui_guard = False
             try:
-                self._leave_overlay_mode(self._ocr_auto_overlay_ctx)
-            finally:
-                self._ocr_auto_overlay_ctx = None
-
-        self._ocr_auto_overlay_last = bool(active)
-
-        if self._goal_ui_poll_active:
-            self._goal_ui_after_id = self.after(200, self._goal_ui_poll)
+                if getattr(self, "_goal_ui_poll_active", True):
+                    self._goal_ui_after_id = self.after(300, self._goal_ui_poll)
+            except Exception:
+                self._goal_ui_after_id = None
 
     def _stop_goal_ui_poll(self):
         self._goal_ui_poll_active = False
@@ -985,7 +1405,7 @@ class OverlayApp(ctk.CTk):
         if not hasattr(self, "_verify_win") or self._verify_win is None or not self._verify_win.winfo_exists():
             self._verify_win = ctk.CTkToplevel(self)
             ver = self._verify_win
-            ver.title("점수 인식 테스트")
+            ver.title("점수/등수 인식 테스트")
             ver.transient(self)
             ver.attributes("-topmost", True)
             ver.protocol("WM_DELETE_WINDOW", lambda: self._destroy_verify_win())
@@ -1063,12 +1483,20 @@ class OverlayApp(ctk.CTk):
         finally:
             self._verify_win = None
 
-        self._alpha_track_enabled = True
         try:
             self.attributes("-topmost", True)
         except:
             pass
-        self.after(0, self._track_pointer_alpha)
+
+        # 이벤트 드리븐 모드면, 상태에 맞춰 1회만 반영
+        try:
+            if getattr(self, "_alpha_evt_enabled", True):
+                if self._is_pointer_inside_window_precise(None):
+                    self._apply_alpha_hover()
+                else:
+                    self._apply_alpha_idle()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 내부 유틸(ROI/OCR)
@@ -1097,14 +1525,10 @@ class OverlayApp(ctk.CTk):
             ctx["alpha"] = float(self.attributes("-alpha"))
         except Exception:
             ctx["alpha"] = 1.0
-        ctx["alpha_track_enabled"] = bool(getattr(self, "_alpha_track_enabled", True))
+        ctx["alpha_evt_enabled"] = bool(getattr(self, "_alpha_evt_enabled", True))
         ctx["goal_ui_poll_active"] = bool(getattr(self, "_goal_ui_poll_active", False))
 
         # 2) 주기 작업 정지(필요한 것만)
-        try:
-            self._alpha_track_enabled = False
-        except Exception:
-            pass
         if not keep_goal_poll:  # ← 조건부로만 폴러 정지
             try:
                 self._stop_goal_ui_poll()
@@ -1132,6 +1556,12 @@ class OverlayApp(ctk.CTk):
         try:
             if ctx.get("was_withdrawn", False):
                 self.deiconify()
+                # 전면/포커스 확보(일부 WM에서 deiconify만으론 뒤로 깔리는 현상 방지)
+                try:
+                    self.lift()
+                    self.focus_force()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1145,11 +1575,17 @@ class OverlayApp(ctk.CTk):
         except Exception:
             pass
 
-        # 3) 트래킹/폴링 재가동
         try:
-            self._alpha_track_enabled = bool(ctx.get("alpha_track_enabled", True))
+            a = float(ctx.get("alpha", 1.0))
+            self._last_attr_alpha = (a if a < 0.999 else None)
         except Exception:
             pass
+
+        # 3) 이벤트 드리븐 플래그 복원(기본 True)
+        try:
+            self._alpha_evt_enabled = bool(ctx.get("alpha_evt_enabled", True))
+        except Exception:
+            self._alpha_evt_enabled = True
         if bool(ctx.get("goal_ui_poll_active", False)):
             try:
                 # 이미 polling 중이 아니면 재시작
@@ -1160,11 +1596,17 @@ class OverlayApp(ctk.CTk):
             except Exception:
                 pass
 
-        # 4) 알파 트래커 킥 + 레이아웃 안정화
+        # 4) 현재 포인터 위치에 맞춰 1회만 적용
         try:
-            self.after(0, self._track_pointer_alpha)
+            if getattr(self, "_alpha_evt_enabled", True):
+                if self._is_pointer_inside_window_precise(None):
+                    self._apply_alpha_hover()
+                else:
+                    self._apply_alpha_idle()
         except Exception:
             pass
+
+        # 레이아웃 안정화
         try:
             self.update_idletasks()
         except Exception:
@@ -1361,6 +1803,14 @@ class OverlayApp(ctk.CTk):
                     self.settings.set("goal.enabled", bool(self.var_goal_enabled.get()))
                 except Exception:
                     pass
+
+                # 불투명도 보강 저장
+                try:
+                    v = float(getattr(self, "_current_opacity", 1.0))
+                    self.settings.set("ui.opacity", v)
+                except Exception:
+                    pass
+
                 self.settings.set("gui._last_geometry", self.geometry())
                 self.settings.save()
             except Exception:
@@ -2755,7 +3205,7 @@ def _ocr_digits_with_fallback(pil_img):
     """
     우선순위:
       0) (있으면) 전용 텍스트 탐지: read_rank_out_of_range_ko → 매칭되면 즉시 (None, raw_t)
-      1) 일반 텍스트 읽기: read_text → '순위권 이탈' 부분일치면 (None, raw_t)
+      1) 일반 텍스트 읽기: read_text
       2) 숫자 읽기: read_digits → 성공 시 (val, raw_d)
       3) 구버전 숫자 폴백: ocr_digits/detect_score
       4) 최후: pytesseract 직접(Text→Digits)
@@ -2773,7 +3223,7 @@ def _ocr_digits_with_fallback(pil_img):
             except Exception:
                 pass
 
-        # (1) 일반 텍스트 → ‘순위권 이탈’ 부분일치
+        # (1) 일반 텍스트
         rt = getattr(_ocr, "read_text", None)
         raw_t = ""
         if callable(rt):
@@ -2848,7 +3298,7 @@ def _run_calib_ocr_and_render(parent_window, result_label, pil_img):
       - ROI를 미리보기 이미지 크기에 맞게 스케일링 후 크롭
       - 결과는 하단 중앙의 한 줄 라벨에만 표시
       - 색상: 두 항목 모두 '인식 성공'이면 초록, 아니면 주황
-        (등수는 '순위권 이탈' 텍스트 부분일치도 성공으로 간주)
+        (등수는 텍스트도 성공으로 간주)
     """
     # 0) ROI 읽기
     try:
@@ -2891,14 +3341,14 @@ def _run_calib_ocr_and_render(parent_window, result_label, pil_img):
         if isinstance(val, int) and val >= 0:
             pts_text, pts_ok = f"점수: {val}점", True
 
-    # 4) 등수 OCR (숫자 또는 '순위권 이탈' 텍스트를 성공으로 인정)
+    # 4) 등수 OCR (숫자 또는 텍스트를 성공으로 인정)
     rank_text, rank_ok = "등수: 인식 실패", False
     if rank_xyxy is not None:
         val, raw = _ocr_digits_with_fallback(_crop_xyxy(pil_img, rank_xyxy))
         if isinstance(val, int) and val > 0:
             rank_text, rank_ok = f"등수: {val}등", True
         elif isinstance(raw, str) and _is_oor_ko(raw):
-            rank_text, rank_ok = "등수: 순위권 이탈", True
+            rank_text, rank_ok = "등수: (숫자 아님)", True
 
     # 5) 하단 결과 라벨(한 줄) 업데이트
     overall_color = _COLOR_OK if (pts_ok and rank_ok) else _COLOR_WARN
