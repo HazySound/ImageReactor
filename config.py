@@ -64,7 +64,6 @@ class ToolTip:
 # ---------------------
 
 ROUTINE_FILE = "routine.json"
-THUMBNAIL_SIZE = (100, 100)
 routine = []
 image_list = []
 image_buttons = {}  # 버튼 참조용
@@ -88,6 +87,36 @@ pm.init_folder()
 root = tk.Tk()
 root.title("루틴 설정")
 
+
+# --- DPI/해상도 자동 스케일 ---
+def _detect_scale(root, base_ppi=96.0, base_w=900, base_h=900, margin=0.92):
+    """
+    - OS/모니터 DPI 반영(os_scale)
+    - 화면에 8% 여유를 남기는 fit_scale
+    - 둘 중 작은 값을 사용(클립 방지 + 비율 유지)
+    """
+    root.update_idletasks()
+    ppi = root.winfo_fpixels('1i')  # 현재 스케일에서의 인치당 픽셀
+    os_scale = max(ppi / base_ppi, 1.0)
+
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    fit_scale = min((sw * margin) / base_w, (sh * margin) / base_h)
+
+    return max(1.0, min(os_scale, fit_scale))
+
+
+SCALE = _detect_scale(root)
+
+
+def S(v: int) -> int:
+    return max(1, int(round(v * SCALE)))
+
+
+THUMBNAIL_SIZE = (S(100), S(100))
+
+# 글꼴/텍스트 단위 스케일(폰트·버튼 크기 자동 반영)
+root.tk.call('tk', 'scaling', SCALE)
+
 # main 프로그램 실행 여부 확인
 if os.path.exists("routine.lock"):
     if check_stale_lock():
@@ -100,15 +129,18 @@ if os.path.exists("routine.lock"):
 create_lock()  # ✅ config 실행 중임을 알리는 잠금 생성
 
 # 화면 중앙 배치
-window_width = 900
-window_height = 900
+BASE_W, BASE_H = 900, 900
+window_width = int(BASE_W * SCALE)
+window_height = int(BASE_H * SCALE)
+
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 x = int((screen_width - window_width) / 2)
 y = int((screen_height - window_height) / 2)
 root.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
-root.resizable(False, False)
+# 고정 해제: 비상 시 사용자가 크기 조절 가능
+root.resizable(True, True)
 
 selected_image_var = tk.StringVar()
 conf_var = tk.DoubleVar(value=0.8)  # 기본값은 일반 루틴 기준
@@ -223,14 +255,39 @@ tk.Label(top_frame, text="🖼 이미지 파일 목록", font=("맑은 고딕", 
 tk.Label(top_frame, text="※ 한글이 포함된 이미지 파일은 표시되지 않습니다", font=("맑은 고딕", 9), fg="gray").pack()
 
 
-canvas = Canvas(top_frame, height=220, width=820)
+canvas = Canvas(top_frame, height=S(220), width=S(820))
 scroll_y = Scrollbar(top_frame, orient="vertical", command=canvas.yview)
 frame_thumbs = tk.Frame(canvas)
+
+# 내용 크기에 맞춰 스크롤영역 갱신
 frame_thumbs.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-canvas.create_window((410, 0), window=frame_thumbs, anchor='n')
+
+# 내부 프레임을 '항상 중앙'에 두기 위해 window id를 잡아둔다
+_win_id = canvas.create_window((canvas.winfo_width() // 2, 0),
+                               window=frame_thumbs, anchor='n')
+
+
+def _center_thumbs(event=None):
+    # Canvas 폭 변동 시 x 좌표를 현재 폭의 절반으로 재설정
+    try:
+        canvas.coords(_win_id, canvas.winfo_width() // 2, 0)
+    except Exception:
+        pass
+
+
+# 리사이즈마다 중앙 재계산
+canvas.bind("<Configure>", _center_thumbs)
+
 canvas.configure(yscrollcommand=scroll_y.set)
 canvas.pack(side="top", fill="both", expand=True)
 scroll_y.pack(side="right", fill="y")
+
+# pack 직후 실제 폭 갱신 및 중앙화 강제 1회
+canvas.update_idletasks()
+canvas.coords(_win_id, canvas.winfo_width() // 2, 0)
+
+# 첫 렌더 직후에도 보정
+canvas.after_idle(_center_thumbs)
 
 
 def contains_korean(text):
@@ -516,11 +573,11 @@ right_frame.pack(side="left", anchor="n")
 tk.Label(right_frame, text="📋 현재 루틴 미리보기", font=("맑은 고딕", 12, "bold")).pack(anchor="w")
 tk.Label(right_frame, text="※ 항목을 우클릭하면 삭제됩니다", font=("맑은 고딕", 9), fg="gray").pack(anchor="w", pady=(0, 0))
 tk.Label(right_frame, text="※ 드래그하여 순서를 변경할 수 있습니다", font=("맑은 고딕", 9), fg="gray").pack(anchor="w", pady=(0, 5))
-preview_canvas_wrapper = tk.Frame(right_frame, height=260)
+preview_canvas_wrapper = tk.Frame(right_frame, height=S(260))
 preview_canvas_wrapper.pack(anchor="w")
 preview_scroll = Scrollbar(preview_canvas_wrapper, orient="vertical")
 preview_scroll.pack(side="right", fill="y")
-preview_canvas = Canvas(preview_canvas_wrapper, yscrollcommand=preview_scroll.set, height=260, width=420)
+preview_canvas = Canvas(preview_canvas_wrapper, yscrollcommand=preview_scroll.set, height=S(260), width=S(420))
 preview_scroll.config(command=preview_canvas.yview)
 preview_canvas.pack(side="left")
 preview_frame = tk.Frame(preview_canvas)
