@@ -9,7 +9,7 @@ from core.email_queue import EmailQueue
 from gui_app import OverlayApp
 from path_manager import ensure_dirs, SETTINGS_JSON, LOCK_FILE
 from lock_utils import acquire_lock, release_lock
-from main import routine_loop  # 네가 main.py에 함수로 만든 routine_loop 가져옴
+from main import routine_loop, reset_runtime_state  # 네가 main.py에 함수로 만든 routine_loop 가져옴
 
 
 def run_gui():
@@ -48,7 +48,7 @@ def run_gui():
         "body_tmpl": settings.get("email.body_tmpl", "본문 내용을 입력해주세요"),
     })
 
-    controller = RunController(routine_loop)
+    controller = RunController(worker=routine_loop, reset_fn=reset_runtime_state)
 
     app = OverlayApp(settings, controller, emailq)
     try:

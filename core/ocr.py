@@ -17,6 +17,53 @@ _TESS_CFG_CACHE = None
 # 모듈 캐시(한 번만 계산)
 _RESOLVED_TESSDATA_DIR = None
 
+# === (초저사양 최적화) Tesseract 쓰레드/우선순위 주입 ===
+# 1) OpenMP 스레드 상한: Tesseract 내부 병렬화를 1코어로 제한
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+def _install_lowprio_for_tesseract() -> None:
+    """
+    pytesseract가 띄우는 tesseract.exe를 'Below Normal' 우선순위로 실행.
+    Windows에서만 적용, 1회 주입.
+    """
+    try:
+        if not sys.platform.startswith("win"):
+            return
+        # pytesseract 내부 subprocess.Popen 래핑
+        _orig_popen = pytesseract.pytesseract.subprocess.Popen  # type: ignore[attr-defined]
+        BELOW_NORMAL = 0x00004000  # Windows Priority Class
+
+        def _lowprio_popen(*args, **kwargs):
+            # tesseract 호출만 대상으로 한정
+            try:
+                cmd0 = None
+                if args and isinstance(args[0], (list, tuple)):
+                    cmd0 = args[0][0]
+                elif "args" in kwargs:
+                    a = kwargs["args"]
+                    cmd0 = a[0] if isinstance(a, (list, tuple)) else None
+                is_tess = (cmd0 and "tesseract" in str(cmd0).lower())
+            except Exception:
+                is_tess = False
+
+            if is_tess:
+                flags = kwargs.get("creationflags", 0) | BELOW_NORMAL
+                kwargs["creationflags"] = flags
+            return _orig_popen(*args, **kwargs)
+
+        if not getattr(pytesseract.pytesseract, "_lowprio_installed", False):  # type: ignore[attr-defined]
+            pytesseract.pytesseract.subprocess.Popen = _lowprio_popen          # type: ignore[attr-defined]
+            pytesseract.pytesseract._lowprio_installed = True                  # type: ignore[attr-defined]
+    except Exception:
+        # 실패해도 기능 저하 없음
+        pass
+
+
+# 모듈 로드 시 1회 설치
+_install_lowprio_for_tesseract()
+
 
 def _tess_cfg_and_env():
     """

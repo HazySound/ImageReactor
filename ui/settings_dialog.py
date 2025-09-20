@@ -1006,26 +1006,67 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception: pass
 
     def _on_save_email(self):
+        if getattr(self, "_save_in_progress", False):
+            return
         cfg = self._collect_email_cfg()
-        self._save_partial_email(cfg)
-        self._apply_live(cfg)
+        # 검증 실패 시 return 하므로 여기서 버튼 잠그기
+        self._save_in_progress = True
+        try:
+            self.btn_save.configure(state="disabled", text="저장 중…")
+            try:
+                self.progress.grid()  # 인디케이터 보이기
+                self.progress.start()
+                self.lbl_status.configure(text="디스크에 저장하는 중…")
+            except Exception:
+                pass
 
-        # UI 재적용(저장된 값이 바로 보이게)
-        sid, sdomain = self._split_sender(cfg.get("sender", ""))
-        self.ent_sender_id.delete(0, "end")
-        self.ent_sender_id.insert(0, sid or "")
-        self.cbo_domain.set(sdomain if sdomain in (GMAIL,NAVER) else GMAIL)
-        self._update_sender_preview()
+            def _work():
+                try:
+                    self.settings.set("email", cfg)
+                    try:
+                        self.settings.flush_debounced(immediate=True)
+                    except Exception:
+                        self.settings.save()
+                    # 라이브 반영 (autoemail/emailq)
+                    try:
+                        import autoemail
+                        autoemail.configure(cfg)
+                        if self.emailq is not None:
+                            self.emailq.configure(cfg)
+                    except Exception:
+                        pass
 
-        self.ent_recipients.delete(0, "end")
-        self.ent_recipients.insert(0, cfg.get("recipients", ""))
+                    # UI 스레드: 베이스라인 갱신 + 상태 리셋
+                    def _ui_done():
+                        try:
+                            self._baseline = self._snapshot_email_ui()
+                            self._mark_dirty(False)  # 저장 버튼 비활성화 유지
+                            self.lbl_status.configure(text="저장됨 ✓")
+                        except Exception:
+                            pass
 
-        messagebox.showinfo("완료", "이메일 설정을 저장했습니다.", parent=self)
-        # 저장 완료 → 현재 상태를 baseline으로, 저장 버튼 비활성화
-        self._baseline = self._snapshot_email_ui()
-        self._mark_dirty(False)
-        try: self.focus_force()
-        except Exception: pass
+                    self.after(0, _ui_done)
+                finally:
+                    def _ui_cleanup():
+                        try:
+                            self.progress.stop()
+                            self.progress.grid_remove()
+                            self.btn_save.configure(text="저장")
+                        except Exception:
+                            pass
+                        setattr(self, "_save_in_progress", False)
+
+                    self.after(0, _ui_cleanup)
+
+            import threading
+            threading.Thread(target=_work, daemon=True).start()
+        except Exception:
+            # 예외 시 복구
+            try:
+                self.btn_save.configure(text="저장", state="normal")
+            except Exception:
+                pass
+            self._save_in_progress = False
 
     # 테스트 메일: 알림 사용 여부와 무관. 진행 상태/스피너 표시.
     def _on_test_email(self):

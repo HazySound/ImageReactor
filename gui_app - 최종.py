@@ -1262,8 +1262,7 @@ class OverlayApp(ctk.CTk):
         if not target_pid:
             return
         self.settings.set("goal.active_preset_id", target_pid)
-        self.settings.queue_save()
-
+        self.settings.save()
         try:
             self.goal_provider.apply_active_preset()
         except Exception:
@@ -1346,50 +1345,6 @@ class OverlayApp(ctk.CTk):
     # ------------------------------------------------------------------
     # 설정/좌표/검증
     # ------------------------------------------------------------------
-    # === 저장 버튼 하이브리드 핸들러 ===
-    def _on_save_click(self, btn):
-        if getattr(self, "_save_in_progress", False):
-            return
-        self._save_in_progress = True
-        try:
-            btn.configure(state="disabled", text="저장 중…")
-        except Exception:
-            pass
-
-        import threading
-
-        def _work():
-            try:
-                # 즉시 커밋(버튼 저장은 지연 없이 확정)
-                self.settings.flush_debounced(immediate=True)
-            finally:
-                # UI 복귀는 메인 스레드
-                try:
-                    self.after(0, lambda: self._after_save_ui(btn))
-                except Exception:
-                    self._save_in_progress = False
-
-        threading.Thread(target=_work, daemon=True).start()
-
-    def _after_save_ui(self, btn):
-        try:
-            btn.configure(text="저장됨 ✓")
-        except Exception:
-            pass
-
-        # 1.2s 후 원복 + 재활성화
-        def _restore():
-            try:
-                btn.configure(text="저장", state="normal")
-            except Exception:
-                pass
-            self._save_in_progress = False
-
-        try:
-            self.after(1200, _restore)
-        except Exception:
-            _restore()
-
     def _open_roi_editor(self):
         """
         ROI 편집기(풀스크린, 원본 좌표) 실행.
@@ -1854,7 +1809,7 @@ class OverlayApp(ctk.CTk):
 
         node["screen"] = {"w": int(sw), "h": int(sh)}
         self.settings.set("ocr", node)
-        self.settings.queue_save()
+        self.settings.save()
 
         # 저장 후 버튼 상태 갱신
         try:
@@ -1887,7 +1842,7 @@ class OverlayApp(ctk.CTk):
         node["screen"] = {"w": int(sw), "h": int(sh)}
 
         self.settings.set("ocr", node)
-        self.settings.queue_save()
+        self.settings.save()
 
         # '좌표 확인' 버튼 상태 갱신
         try:
@@ -1928,7 +1883,7 @@ class OverlayApp(ctk.CTk):
                     pass
 
                 self.settings.set("gui._last_geometry", self.geometry())
-                self.settings.flush_debounced(immediate=True)
+                self.settings.save()
             except Exception:
                 pass
             # 전역 핫키 해제(등록 실패했더라도 안전)

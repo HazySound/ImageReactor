@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict
+import threading, time, atexit
 
 DEFAULTS: Dict[str, Any] = {
     "gui": {
@@ -120,6 +121,12 @@ class SettingsManager:
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         self.data: Dict[str, Any] = {}
         self.load()
+        # Debounced save state
+        self._save_lock = threading.Lock()
+        self._debounce_timer: threading.Timer | None = None
+        self._debounce_due: float = 0.0        # 다음 예약 실행 시각(epoch)
+        self._debounce_deadline: float = 0.0   # 최대 지연 마감 시각(epoch)
+        atexit.register(lambda: self.flush_debounced(immediate=True))
 
     # === SettingsManager.load() 수정 ===
     def load(self) -> None:
@@ -145,7 +152,63 @@ class SettingsManager:
             self.save()
 
     def save(self) -> None:
-        self.json_path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        text = json.dumps(self.data, ensure_ascii=False, indent=2)
+        tmp = self.json_path.with_suffix(self.json_path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(self.json_path)  # 원자적 교체(같은 파티션 가정)
+
+    def queue_save(self, *, delay_ms: int = 800, max_delay_ms: int = 3000) -> None:
+        """연속 set() 이후 디바운스로 저장 예약."""
+        now = time.time()
+        delay = max(0.05, delay_ms / 1000.0)
+        maxd  = max(delay, max_delay_ms / 1000.0)
+
+        with self._save_lock:
+            # 마감(최대 지연) 갱신
+            if self._debounce_timer is None:
+                self._debounce_deadline = now + maxd
+            # 다음 실행 예정 시각
+            self._debounce_due = now + delay
+
+            # 기존 타이머 취소 후 재예약
+            if self._debounce_timer is not None:
+                try:
+                    self._debounce_timer.cancel()
+                except Exception:
+                    pass
+
+            def _runner():
+                # 최대 지연 마감 이전이면 다시 재예약(버스트 흡수)
+                with self._save_lock:
+                    if time.time() < self._debounce_due and time.time() < self._debounce_deadline:
+                        rem = max(0.01, min(self._debounce_due, self._debounce_deadline) - time.time())
+                        self._debounce_timer = threading.Timer(rem, _runner)
+                        self._debounce_timer.daemon = True
+                        self._debounce_timer.start()
+                        return
+                    # 커밋
+                    self._debounce_timer = None
+                # 락 밖에서 실제 디스크 쓰기
+                self.save()
+
+            # 최초 예약
+            next_in = max(0.01, min(self._debounce_due, self._debounce_deadline) - now)
+            self._debounce_timer = threading.Timer(next_in, _runner)
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
+
+    def flush_debounced(self, *, immediate: bool = False) -> None:
+        """대기중 저장을 즉시 커밋. immediate=True면 예약을 취소하고 바로 저장."""
+        with self._save_lock:
+            t = self._debounce_timer
+            self._debounce_timer = None
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if immediate:
+            self.save()
 
     def get(self, path: str, default=None):
         node = self.data

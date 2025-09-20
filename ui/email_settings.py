@@ -135,8 +135,9 @@ class EmailSettingsDialog(ctk.CTkToplevel):
         btn_test.grid(row=0, column=0, sticky="w")
         btn_cancel = ctk.CTkButton(bar, text="취소", command=self.destroy)
         btn_cancel.grid(row=0, column=2, sticky="e", padx=(6,0))
-        btn_save = ctk.CTkButton(bar, text="저장", command=self._on_save)
-        btn_save.grid(row=0, column=1, sticky="e", padx=(6,0))
+        self.btn_save = ctk.CTkButton(bar, text="저장",
+                                      command=lambda: self._on_save(self.btn_save))
+        self.btn_save.grid(row=0, column=1, sticky="e", padx=(6, 0))
 
     def _collect(self) -> dict | None:
         # 숫자 변환/필수값 검증
@@ -190,15 +191,48 @@ class EmailSettingsDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _on_save(self):
+    def _on_save(self, btn):
+        if getattr(self, "_save_in_progress", False):
+            return
         cfg = self._collect()
-        if cfg is None: return
-        # 저장
-        self.settings.set("email", cfg)
-        self.settings.save()
-        self._apply_live(cfg)
-        messagebox.showinfo("완료", "이메일 설정이 저장되었고 즉시 반영되었습니다.", parent=self)
-        self.destroy()
+        if cfg is None:
+            return
+
+        # 클릭 즉시 잠금 + 라벨 변경
+        self._save_in_progress = True
+        try:
+            btn.configure(state="disabled", text="저장 중…")
+        except Exception:
+            pass
+
+        import threading
+
+        def _work():
+            try:
+                # 값 반영
+                self.settings.set("email", cfg)
+                # 버튼 저장은 즉시 커밋
+                try:
+                    self.settings.flush_debounced(immediate=True)
+                except Exception:
+                    # 디바운스 미구현일 수도 있으니 안전하게 직접 저장
+                    self.settings.save()
+                # 런타임 적용
+                self._apply_live(cfg)
+                # UI 스레드에서 알림/종료
+                self.after(0, lambda: (
+                    messagebox.showinfo("완료", "이메일 설정이 저장되었고 즉시 반영되었습니다.", parent=self),
+                    self.destroy()
+                ))
+            finally:
+                # 파괴되지 못한 경우를 대비한 안전 복구
+                try:
+                    self.after(1200, lambda: (setattr(self, "_save_in_progress", False),
+                                              btn.configure(text="저장", state="normal")))
+                except Exception:
+                    setattr(self, "_save_in_progress", False)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _on_test(self):
         cfg = self._collect()

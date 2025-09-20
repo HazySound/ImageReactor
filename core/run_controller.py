@@ -15,14 +15,23 @@ class RunController:
     worker 시그니처 권장:
       def worker(stop_event: Event, state_cb: Callable[[str], None], log_cb: Callable[[str], None]) -> None: ...
     """
-    def __init__(self, worker: Callable[[Event, Callable[[str], None], Callable[[str], None]], None]):
+
+    def __init__(self, worker: Callable[[Event, Callable[[str], None], Callable[[str], None]], None],
+                 reset_fn: Optional[Callable[[], None]] = None):
         self._worker = worker
+        self._reset_fn = reset_fn
         self._stop_event = Event()
         self._th: Optional[Thread] = None
         self._state_q: "Queue[str]" = Queue()
         self._log_q: "Queue[str]" = Queue()
         self._running = False
         self._watch_th: Optional[Thread] = None  # ← 워커 종료 감시용
+
+    # --- 공통 초기화(shim) ---
+    def reset_runtime_state(self) -> None:
+        fn = getattr(self, "_reset_fn", None)
+        if callable(fn):
+            fn()
 
     # 외부 폴링
     def poll_state(self) -> Optional[str]:

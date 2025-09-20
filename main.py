@@ -25,15 +25,12 @@ from core.goal_policy import GoalPolicy, build_goal_policy
 import cv2, numpy as np
 from typing import Dict, Set, Tuple, Optional
 from core.home_probe import HomeProbe, get_home_anchor_template  # 홈 확인 루틴/헬퍼
-from ocr.metrics_reader import read_metrics_from_home, HomeOCRConfig  # 홈 OCR :contentReference[oaicite:2]{index=2}
 from core.state_store import get_state_store  # OCR 중 UI잠금 플래그 :contentReference[oaicite:3]{index=3}
 from core.utils_anchor import load_home_anchor_threshold
 from core.image_utils import safe_crop
 from core.roi_cache import load_roi as roi_load, commit_roi as roi_commit
 from core.freeze_monitor import FreezeMonitor
 from core.autolearn import AutoLearnStore
-from core.ocr import _match_out_of_range_ko as _is_oor_ko
-from core.score_calib import load_scaled_rois_for_current_screen
 from core.roi_from_settings import (
     run_home_ocr_like_gui,                # GUI와 동일 OCR 실행
     read_rois_xywh_from_settings,         # ← ROI (x,y,w,h) 그대로 읽기
@@ -49,6 +46,14 @@ SETTINGS = SettingsManager(SETTINGS_JSON)  # pm.DATA_DIR 하의 공식 경로
 _LOOP_INTERVAL_SEC = float(SETTINGS.get("perf.loop_interval_sec", 0.45))   # 루틴 호출 간격
 _IDLE_SLEEP_SEC = float(SETTINGS.get("perf.idle_sleep_sec", 0.016))      # 내부 idle 슬립
 _AWAIT_STEP_MIN_MS = int(SETTINGS.get("perf.await_step_min_ms", 140))      # AWAIT 프레임 간격
+
+# --- GUI busy 워치독/스로틀 파라미터 ---
+_BUSY_WATCHDOG_MS = int(SETTINGS.get("perf.busy_watchdog_ms", 2000))   # 2s
+_BUSY_THROTTLE_SEC = float(SETTINGS.get("perf.busy_throttle_sec", 0.35))# 350ms
+
+# --- busy 워치 상태(전역) ---
+_BUSY_SINCE_MS: int = 0
+_BUSY_DID_GC: bool = False
 
 pm.chdir_to_base()  # ★ 시작 즉시
 
@@ -71,6 +76,42 @@ try:
         _OCR_BASE_WH = (int(_bw), int(_bh))
 except Exception:
     _OCR_BASE_WH = None
+
+# === Tesseract/Leptonica/OpenMP 스레드 상한(초저사양 최적화) ===
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+def _sync_screen_profile() -> None:
+    """
+    현재 화면 해상도(width,height)와 settings.ocr.screen.w/h가 다르면:
+      - settings에 현재 해상도 기록(원자 저장)
+      - 메모리 캐시/홈 ROI 캐시 무효화
+      - 다음 1회 풀프레임 스캔 강제(_SKIP_FILE_ROI_ONCE=True)
+    """
+    try:
+        cur_wh = (width, height)
+        cfg_w = SETTINGS.get("ocr.screen.w")
+        cfg_h = SETTINGS.get("ocr.screen.h")
+        cfg_wh = (int(cfg_w), int(cfg_h)) if (cfg_w and cfg_h) else None
+    except Exception:
+        cfg_wh = None
+
+    if cfg_wh != cur_wh:
+        # settings 갱신 + 원자 저장
+        SETTINGS.set("ocr.screen.w", cur_wh[0])
+        SETTINGS.set("ocr.screen.h", cur_wh[1])
+        try:
+            SETTINGS.save()  # 원자 저장(임시파일→replace)
+        except Exception:
+            pass
+
+        # 캐시/상태 무효화
+        globals()["_ROUTINE_ROI"] = {}
+        globals()["_CACHED_ROI"] = None
+        globals()["_LAST_BBOX"] = None
+        globals()["_HOME_FF_TRIES"] = 0
+        globals()["_SKIP_FILE_ROI_ONCE"] = True
 
 
 _PLACEHOLDER_EMAIL = "example@gmail.com"
@@ -160,6 +201,38 @@ _WANT_AWAIT_HOME: bool = False   # 루틴 단락이 실제로 발생했을 때�
 _HOME_OCR_DONE: bool = False     # '현재 홈 체류'에서 OCR을 1회 수행했는가
 
 
+# [ADD] 공통 초기화: 토글 ON/OFF 전용
+def reset_runtime_state() -> None:
+    global probe, cached_home_roi, t_trigger_ms
+    global _HOME_TPL_PATH, _HOME_SCREEN_WH, _CACHED_ROI, _LAST_BBOX, _SKIP_FILE_ROI_ONCE
+    global _ROUTINE_ROI, _LOG_LAST_TS, _AUTOLEARN
+    global _WANT_AWAIT_HOME, _HOME_OCR_DONE
+    global _HOME_FF_TRIES, _AWAIT_ENTER_MS
+
+    probe = None
+    cached_home_roi = None
+    t_trigger_ms = None
+
+    _CACHED_ROI = None
+    _LAST_BBOX = None
+    _SKIP_FILE_ROI_ONCE = False
+    _HOME_FF_TRIES = 0
+    _AWAIT_ENTER_MS = None
+
+    _WANT_AWAIT_HOME = False
+    _HOME_OCR_DONE = False
+
+    # 루틴 ROI 캐시(메모리)도 세션 시작 시 초기화
+    _ROUTINE_ROI.clear()
+
+    # 레이트리밋/로그 히스토리 초기화
+    _LOG_LAST_TS.clear()
+
+    # busy 워치 상태 리셋
+    globals()["_BUSY_SINCE_MS"] = 0
+    globals()["_BUSY_DID_GC"] = False
+
+
 # --- [ADD] 로컬 헬퍼: 이 루틴 이미지가 '등록된 홈 앵커 템플릿'인가? ---
 def _is_home_anchor(img_file: str) -> bool:
     """
@@ -207,6 +280,15 @@ def _roi_key_for_image(image_filename: str) -> str:
 
 
 def _routine_roi_load(image_filename: str) -> list[tuple[int,int,int,int]]:
+    # 해상도 프로파일 불일치 시 캐시 사용 금지
+    try:
+        cfg_w = SETTINGS.get("ocr.screen.w")
+        cfg_h = SETTINGS.get("ocr.screen.h")
+        if not (cfg_w and cfg_h) or int(cfg_w) != width or int(cfg_h) != height:
+            return []
+    except Exception:
+        return []
+
     key = _roi_key_for_image(image_filename)
     lst = _ROUTINE_ROI.get(key)
     if isinstance(lst, list) and lst:
@@ -270,6 +352,35 @@ def _wait_gui_hidden_for_ocr(max_wait_ms: int = 450) -> None:
     loops = remain // step
     for _ in range(max(1, loops)):
         time.sleep(step / 1000.0)
+
+
+def _busy_throttle_gate(store) -> bool:
+    """
+    UI busy일 때:
+      - 폴링 감속(_BUSY_THROTTLE_SEC 만큼 sleep)
+      - 연속 busy >= _BUSY_WATCHDOG_MS면 1회 gc.collect()
+      - True 반환 시 '이번 턴은 스킵' 의미
+    """
+    global _BUSY_SINCE_MS, _BUSY_DID_GC
+    try:
+        if store.is_ui_busy():
+            now_ms = int(time.time() * 1000)
+            if _BUSY_SINCE_MS == 0:
+                _BUSY_SINCE_MS = now_ms
+            elif (now_ms - _BUSY_SINCE_MS) >= _BUSY_WATCHDOG_MS and not _BUSY_DID_GC:
+                import gc
+                gc.collect()
+                _BUSY_DID_GC = True
+            time.sleep(_BUSY_THROTTLE_SEC)
+            return True
+        else:
+            # busy 해제 → 워치 상태 리셋
+            _BUSY_SINCE_MS = 0
+            _BUSY_DID_GC = False
+            return False
+    except Exception:
+        # store 조회 실패 등은 busy 미적용으로 간주
+        return False
 
 
 def _log(msg: str) -> None:
@@ -564,35 +675,67 @@ def esckeypress(files):
 
 
 # --- 이메일 발송 가드 ---
-def _email_guarded(ev_key: str, payload: dict | None = None) -> bool:
+def _email_guarded(event_key: str, payload: dict | None = None) -> None:
     """
-    전역 ON + 개별 ON일 때만 메일 발송.
-    저장창에서 설정이 바뀐 직후에도 최신값을 보도록, 읽기 전에 reload.
+    디스크 재로딩 금지. 항상 런타임 스냅샷만 사용.
     """
+    payload = payload or {}
     try:
-        # ★ 최신 settings 반영
+        from core.email_queue import EmailQueue  # 타입 힌트 목적
+
+        snap = autoemail.get_snapshot()  # { ..., "version": N, "taken_at": ts }
+        if snap.get("enabled") is None:
+            # Legacy 모드: autoemail.send_email로 그냥 보냄
+            ok = autoemail.send_email(event=event_key, payload=payload)
+            _log(f"[email][legacy] event={event_key} ok={ok}")
+            return
+
+        # GUI 모드: email_queue 사용 중이면 큐로 던진다.
+        # (이 함수가 emailq 인스턴스에 접근 가능한 컨텍스트라면 다음과 같이 사용)
         try:
-            SETTINGS.load()  # 디스크 → 메모리 재적재
+            emailq = globals().get("EMAIL_QUEUE")  # 전역으로 주입돼 있다면 사용
         except Exception:
-            pass
+            emailq = None
 
-        cfg = SETTINGS.get("email", {}) or {}
-        if not cfg.get("enabled", False):
-            return False
+        if emailq is not None:
+            emailq.enqueue(event_key, payload)
+            _log(f"[email][enqueue] event={event_key} cfg_v={snap.get('version')} at={int(snap.get('taken_at') or 0)}")
+        else:
+            # 큐가 없으면 즉시 발송
+            subj, body = _render_from_snap_for_main(snap, event_key, payload)
+            ok = _send_mail_from_main(subj, body, snap)
+            _log(f"[email][direct] event={event_key} ok={ok} cfg_v={snap.get('version')} at={int(snap.get('taken_at') or 0)}")
 
-        evs = (cfg.get("events") or {})
-        ev_on = bool((evs.get(ev_key) or {}).get("enabled", False))
-        if not ev_on:
-            return False
-
-        autoemail.send_email(event=ev_key, payload=payload or {})
-        return True
     except Exception as e:
-        try:
-            print(f"[email] '{ev_key}' 발송 실패/스킵: {e}")
-        except Exception:
-            pass
-        return False
+        _log(f"[email][error] event={event_key} err={e}")
+
+
+def _render_from_snap_for_main(c: dict, event: str, p: dict) -> tuple[str, str]:
+    ev_map = (c.get("templates") or {})
+    ev = (ev_map.get(event) or {})
+    st = (ev.get("subject") or c.get("subject_tmpl") or "[Manager] {event}")
+    bt = (ev.get("body") or c.get("body_tmpl") or "{event}")
+    return st.format(event=event, **p), bt.format(event=event, **p)
+
+
+def _send_mail_from_main(subject: str, body: str, c: dict) -> bool:
+    import smtplib
+    from email.mime.text import MIMEText
+
+    if not c.get("enabled"): return False
+    sender=c.get("sender",""); pwd=c.get("app_password","")
+    rcpts=[r.strip() for r in (c.get("recipients","").replace("\n",",").split(",")) if r.strip()]
+    if not sender or not pwd or not rcpts: return False
+    host=c.get("smtp_host") or ("smtp.gmail.com" if c.get("provider")=="gmail" else "")
+    port=int(c.get("smtp_port",587)); use_tls=bool(c.get("use_tls",True))
+    msg=MIMEText(body,_charset="utf-8"); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=", ".join(rcpts)
+    if use_tls:
+        with smtplib.SMTP(host=host, port=port, timeout=15) as s:
+            s.ehlo(); s.starttls(); s.ehlo(); s.login(sender,pwd); s.sendmail(sender, rcpts, msg.as_string())
+    else:
+        with smtplib.SMTP(host=host, port=port, timeout=15) as s:
+            s.login(sender,pwd); s.sendmail(sender, rcpts, msg.as_string())
+    return True
 
 
 def client_crashed(img):
@@ -703,8 +846,16 @@ def execute_routine(routine_list):
                 # 이번 '홈 체류'에서 아직 OCR을 하지 않았을 때만 단락
                 if _is_home_anchor(img_file):
                     if not _HOME_OCR_DONE:
-                        _WANT_AWAIT_HOME = True  # ← 이번 사이클에서만 AWAIT_HOME 허용
-                        return
+                        _WANT_AWAIT_HOME = True
+                        # 목표 ON에서만 조기 리턴 허용
+                        try:
+                            from core.goal_policy import GoalPolicy  # 이미 상단 import되어 있으면 생략
+                            goal_enabled = bool(SETTINGS.get("goal.enabled", False))
+                        except Exception:
+                            goal_enabled = False
+
+                        if goal_enabled:
+                            return
                     else:
                         _HOME_OCR_DONE = False
 
@@ -890,6 +1041,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
     _CONFIRM_WINDOW_MS = _GOAL_CONFIRM_WINDOW_MS
     _RUNTIME_LOG_CB = log_cb
 
+    _sync_screen_profile()
+
     # --- [NEW] 초기 autoemail 설정 주입 ---
     email_cfg = SETTINGS.get("email", {})
     # 기본값 보정
@@ -961,6 +1114,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
             start_event.clear()
             stop_event.clear()  # ★ 추가: 재시작 시 전역 stop 잔류 제거
             log_cb("\n============반복 시작============")
+            reset_runtime_state()
             state_cb("RUNNING")
 
             while not stop_event.is_set() and not stop_event_global.is_set():
@@ -968,10 +1122,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                 # ★ UI 상호작용(창 이동/리사이즈) 중에는 무거운 작업을 잠깐 쉰다
                 try:
-                    if store.is_ui_busy():
-                        time.sleep(0.02)  # CPU 점유 완화
-                        last_run = now  # 주기 타이머 리셋(불필요한 실행 방지)
-                        # 프리즈틱/캡처도 아래에서 스킵됨
+                    if _busy_throttle_gate(store):
+                        last_run = now  # 주기 타이머 리셋
                         continue
                 except Exception:
                     pass
@@ -989,9 +1141,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                 if now - last_run >= interval:
                     # ★ 드래그 중엔 루틴 실행 자체를 건너뛰어 클릭/탬플릿매칭 비용 차단
                     try:
-                        if store.is_ui_busy():
+                        if _busy_throttle_gate(store):
                             last_run = now
-                            # busy 중에는 아래 AWAIT_HOME 쪽도 스킵
                             continue
                     except Exception:
                         pass
@@ -1038,8 +1189,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                 if probe is not None:
                     # ★ 드래그 중이면 캡처/매칭/프리즈틱 자체를 잠깐 쉰다
                     try:
-                        if store.is_ui_busy():
-                            time.sleep(0.01)
+                        if _busy_throttle_gate(store):
                             continue
                     except Exception:
                         pass
@@ -1073,8 +1223,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                     # ★ 여기서도 busy면 프리즈틱 스킵
                     try:
-                        if store.is_ui_busy():
-                            time.sleep(0.005)
+                        if _busy_throttle_gate(store):
                             continue
                     except Exception:
                         pass
