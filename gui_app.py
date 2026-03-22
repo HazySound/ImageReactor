@@ -14,7 +14,7 @@ from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 import autoemail
 from control_bus import start_event, stop_event
 from core.goal_provider import GoalConfigProvider
-from core.score_calib import load_scaled_rois_for_current_screen # 기존 로직 유지 (목표달성 토글 검증용)
+from core.score_calib import load_scaled_rois_for_current_screen  # 기존 로직 유지 (목표달성 토글 검증용)
 # Tesseract 경로 자동 탐지/검증/주입
 from core.ocr import (
     auto_find_tesseract_path,
@@ -88,6 +88,14 @@ class OverlayApp(ctk.CTk):
         self.configure(fg_color=THEME["APP_BG"])
 
         self.settings = settings_mgr
+        # ★ 메인 모듈에 동일 인스턴스 주입(SSOT 통일)
+        try:
+            import main as _main
+            if hasattr(_main, "set_settings_manager"):
+                _main.set_settings_manager(self.settings)
+        except Exception:
+            pass
+
         self.controller = controller
         self.emailq = email_queue
         self.goal_provider = GoalConfigProvider(self.settings)
@@ -123,13 +131,22 @@ class OverlayApp(ctk.CTk):
         self._ALPHA_LEAVE_DELAY_MS = 120  # Leave 후 지연 적용
         self._ALPHA_BORDER_INSET_PX = 6  # 경계 히스테리시스(공간)
 
-        self._alpha_evt_enabled = True  # 이벤트 드리븐 on/off
+        self._alpha_evt_enabled = False  # 이벤트 드리븐 on/off
         self._alpha_inside = False  # 현재 포인터가 창 내부로 판정되었는지
         self._alpha_leave_deadline_ms = 0  # Leave 지연 데드라인(ms)
         self._alpha_leave_after_id = None  # 단일 after 핸들
 
         self.idle_alpha = float(self._current_opacity)
+        # 저사양 모드 ↔ 일반 모드 전환 시 복원용 상태
+        self._low_spec_applied: bool = bool(self.settings.get("gui.low_spec", False))
+        self._opacity_before_low_spec: float | None = None
         self.hover_alpha = 1.0
+
+        self._wndproc_installed = False  # 현재 WNDPROC 서브클래싱 여부
+        self._orig_wndproc = None  # 복원용 원래 WNDPROC 포인터
+        self._win32_hook_handle = None  # 이미 있다면 유지
+        self._win32_cb = None  # 이미 있다면 유지
+        self._win32_hook_last_ts = 0.0  # ← 마지막 설치/해제 시각(초) for 디바운스
 
         # layered 적용 여부 추적(마지막으로 attributes로 적용한 값)
         self._last_attr_alpha = None
@@ -152,7 +169,7 @@ class OverlayApp(ctk.CTk):
         self._init_goal_ui_bindings()
 
         # ── 단일 UI 틱 설정 ──
-        self._TICK_MS = 250  # 250~300ms 권장
+        self._TICK_MS = int(self.settings.get("gui.tick_ms", 250))  # 250~300ms 권장
         self._ui_tick_guard = False  # 재진입 방지
         # 폴링 예약 핸들(없으면 None)
         self._poll_after_id = None
@@ -160,6 +177,19 @@ class OverlayApp(ctk.CTk):
         # [ADD] 시작 시 마지막 상태 복원에 따른 시각/로그 반영
         self._sync_goal_visual()
         self._log_startup_goal_and_hotkey()
+
+        # main 모듈에 상태 로거를 주입해 예약 종료/상태 메시지가 색상 로그로 찍히게 함
+        try:
+            import main as _mainmod
+            if hasattr(self, "log_status"):
+                _mainmod.set_status_logger(self.log_status)  # (text, fg) 시그니처
+                _mainmod.log_scheduled_shutdown_state_current()
+                _mainmod.log_spam_state()
+        except Exception:
+            pass
+
+        if bool(self.settings.get("gui.low_spec", False)):
+            self._apply_low_spec_profile()
 
         # 다음 틱 예약(단일 루프)
         self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
@@ -199,14 +229,11 @@ class OverlayApp(ctk.CTk):
         # 리사이즈/이동은 디바운스된 핸들러로 교체
         self.bind("<Configure>", self._on_root_configure)
 
-        # 최상위 기준으로만 Enter/Leave 처리(자식 위젯 간 이동 오발 방지)
-        self.bind("<Enter>", self._on_win_enter, add="+")
-        self.bind("<Leave>", self._on_win_leave, add="+")
-
         self._cfg_after = None  # 디바운스 핸들러용 타이머 핸들
         # Windows에서 이동/리사이즈 시작/종료를 정확히 잡아내는 훅
         try:
-            self._install_win32_movesize_hooks()
+            if not bool(self.settings.get("gui.low_spec", False)):
+                self._install_win32_movesize_hooks()
         except Exception:
             pass
 
@@ -230,6 +257,20 @@ class OverlayApp(ctk.CTk):
 
         self._ocr_auto_overlay_ctx = None
         self._ocr_auto_overlay_last = False
+
+        # 윈도우 핸들 준비
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+        # 시작 시 훅 상태 맞춤: low_spec → 해제, 아니면 설치
+        try:
+            want_install = not bool(self.settings.get("gui.low_spec", False))
+            # mainloop 전이라도 after(0)로 예약하면 안전
+            self.after(0, lambda: self._ensure_win32_hooks(want_install))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # UI
@@ -261,7 +302,8 @@ class OverlayApp(ctk.CTk):
         self.lbl_goal.pack(side="left", padx=(0, PAD_SMALL))
 
         self.var_goal_enabled = tk.BooleanVar(value=bool(self.settings.get("goal.enabled", False)))
-        self.sw_goal = ctk.CTkSwitch(bar, text=None, variable=self.var_goal_enabled, command=self._on_goal_toggle, width=44)
+        self.sw_goal = ctk.CTkSwitch(bar, text=None, variable=self.var_goal_enabled, command=self._on_goal_toggle,
+                                     width=44)
         self.sw_goal.pack(side="left", padx=(0, PAD_TINY))
 
         goal_presets = self.settings.get("goal.presets", {}) or {}
@@ -321,7 +363,8 @@ class OverlayApp(ctk.CTk):
             t.tag_configure("amber", foreground="#F59E0B")
             t.tag_configure("gray", foreground="#9CA3AF")
             t.tag_configure("red", foreground="#EF4444")
-            t.tag_configure("bold",  font=(log_font_family, log_font_size, "bold"))  # ✅ 위와 동일 크기
+            t.tag_configure("bold", font=(log_font_family, log_font_size, "bold"))  # ✅ 위와 동일 크기
+            t.tag_configure("cyan", foreground="#00BCD4")
         except Exception:
             pass
 
@@ -389,27 +432,44 @@ class OverlayApp(ctk.CTk):
     # ------------------------------------------------------------------
     # --- Opacity helpers (최소 비용) ---
     def _on_opacity_drag(self, val):
-        # 드래그 중엔 미리보기만 (layered 전환 최소화)
+        # 저사양 모드에서는 슬라이더 입력 무시
+        if bool(self.settings.get("gui.low_spec", False)):
+            return
+
+        # 슬라이더 미리보기: 항상 현재 값 즉시 반영(hover/inside 무시)
         try:
             v = max(0.35, min(1.0, float(val)))
         except Exception:
             return
         self._current_opacity = v
         self.idle_alpha = float(v)
-        # 창 밖(idle)일 때만 미리 반영, 안에 있으면 1.0 유지
-        if not getattr(self, "_alpha_inside", False):
-            self._apply_alpha_idle()
+        # busy 중일 땐 _set_alpha_if_needed 내부 가드로 자연 스킵됨
+        self._set_alpha_if_needed(v, update_idle=True, force=True, tag="drag")
 
     def _on_opacity_release(self, _evt=None):
+        # 저사양 모드에서는 커밋 무시
+        if bool(self.settings.get("gui.low_spec", False)):
+            return
+
+        # 1) 드래그 종료 시 busy 먼저 OFF
+        try:
+            self._ui_busy_set(False)
+        except Exception:
+            pass
+
         v = float(getattr(self, "_current_opacity", 1.0))
         self.idle_alpha = float(v)
-        # 상태에 따라 최종 적용
-        if getattr(self, "_alpha_inside", False):
-            self._apply_alpha_hover()
-        else:
-            self._apply_alpha_idle()
 
-        # settings.json 저장
+        # 2) 즉시 적용 (busy 가드 우회 보장을 위해 after(0)로 한 번 더 안전하게)
+        try:
+            # 즉시 한 번
+            self._set_alpha_if_needed(v, update_idle=True, force=True, tag="release")
+            # 이벤트 전파 순서에 대비해 다음 틱에서도 한 번 더
+            self.after(0, lambda: self._set_alpha_if_needed(v, update_idle=True, force=True, tag="release+after"))
+        except Exception:
+            pass
+
+        # 3) settings.json 저장
         try:
             self.settings.set("ui.opacity", float(v))
             self.settings.save()
@@ -417,7 +477,16 @@ class OverlayApp(ctk.CTk):
             pass
 
     def _on_root_configure(self, _e=None):
-        # 즉시 busy ON
+        # 디바운스: 50ms 이내 중복 Configure 이벤트 무시 (창 드래그 시 수십 회/초 발생 방지)
+        try:
+            if self._cfg_after is not None:
+                return
+            self._cfg_after = self.after(50, self._on_root_configure_debounced)
+        except Exception:
+            pass
+
+    def _on_root_configure_debounced(self):
+        self._cfg_after = None
         try:
             self._ui_busy_set(True)
         except Exception:
@@ -445,46 +514,43 @@ class OverlayApp(ctk.CTk):
         except Exception:
             return False
 
-    def _set_alpha_if_needed(self, v: float, *, update_idle: bool = False) -> None:
-        """
-        동일값이면 호출 생략.
-        - update_idle=True일 때만 idle_alpha를 갱신한다(hover에서는 절대 갱신 금지).
-        - v>=1.0로 올릴 때, 창이 layered(<1.0 적용 경험) 상태면 1.0을 실제로 한 번 적용해 non-layered로 복귀시킨다.
-        """
+    def _set_alpha_if_needed(self, v, update_idle=False, *, force: bool = False, tag: str = ""):
         try:
-            v = float(v)
+            store = get_state_store()
+            busy = bool(store.is_ui_busy())
         except Exception:
-            return
-        v = max(0.35, min(1.0, v))
+            busy = False
 
-        cur = float(getattr(self, "_current_opacity", 1.0))
-        # 1.0 승격(레거시 layered→non-layered 복귀)이 필요한 경우를 예외로 하여 스킵 판단
-        if abs(cur - v) <= 1e-3 and not (v >= 0.999 and getattr(self, "_last_attr_alpha", None) is not None):
-            return
-
-        self._current_opacity = v
-        if update_idle:
-            self.idle_alpha = float(v)
-
-        # busy/드래그/리사이즈 중엔 변경 금지
         try:
-            if get_state_store().is_ui_busy():
+            prev = float(self.attributes("-alpha"))
+        except Exception:
+            prev = float(getattr(self, "_current_opacity", 1.0))
+
+        # busy 가드
+        if busy and not force:
+            # self._log_gui(f"[alpha] SKIP busy tag={tag} v={v:.3f} prev={prev:.3f}")
+            return
+
+        # 동일값 스킵
+        try:
+            if abs(prev - float(v)) < 1e-3:
+                if update_idle:
+                    self.idle_alpha = float(v)
                 return
         except Exception:
             pass
 
+        # 실제 적용
         try:
-            if v >= 0.999:
-                # layered→non-layered 복귀가 필요하면 1.0 한 번 실제 적용
-                if getattr(self, "_last_attr_alpha", None) is not None:
-                    self.attributes("-alpha", 1.0)
-                    self._last_attr_alpha = None
-                return  # 이미 non-layered면 호출 생략
-            # v < 1.0: layered 적용
-            self.attributes("-alpha", v)
-            self._last_attr_alpha = v
-        except Exception:
-            pass
+            self.attributes("-alpha", float(v))
+        except Exception as e:
+            try:
+                self._log_gui(f"[alpha][ERR] set failed: {e}")
+            except Exception:
+                pass
+
+        if update_idle:
+            self.idle_alpha = float(v)
 
     def _apply_alpha_hover(self):
         self._set_alpha_if_needed(1.0, update_idle=False)  # ★ hover는 idle_alpha 건드리지 않음
@@ -557,6 +623,145 @@ class OverlayApp(ctk.CTk):
         # 외부에서 'idle 목표'를 명시적으로 바꿀 때만 사용
         self._set_alpha_if_needed(v, update_idle=True)
 
+    def _ensure_win32_hooks(self, want: bool) -> None:
+        """want=True → 설치, want=False → 해제. 이미 원하는 상태면 No-Op."""
+        # (선택) 0.5s 디바운스가 있다면, 스킵 시에도 로그 남김
+        try:
+            import time as _t
+            if (_t.time() - float(getattr(self, "_win32_hook_last_ts", 0.0))) < 0.5:
+                return
+        except Exception:
+            pass
+
+        installed = bool(getattr(self, "_wndproc_installed", False))
+        if want and not installed:
+            self._install_win32_movesize_hooks()
+            return
+        if (not want) and installed:
+            self._uninstall_win32_hooks()
+            return
+
+    def _toggle_low_spec(self, enabled: bool) -> None:
+        """
+        저사양 on/off 시 런타임 적용.
+        규칙: on → topmost=False, off → topmost=True (설정값 무시, 고정 규칙)
+        부가: on 시 현재 불투명도 스냅샷 저장, off 시 원복 + 슬라이더 활성화
+        """
+        if enabled == getattr(self, "_low_spec_applied", False):
+            return  # 상태 변화 없음 → 아무 것도 하지 않음
+
+        slider = getattr(self, "alpha_slider", None)
+
+        if enabled:
+            # 1) 현재 불투명도 스냅샷 저장(복원용)
+            try:
+                cur_alpha = float(self.attributes("-alpha"))
+            except Exception:
+                cur_alpha = float(getattr(self, "_current_opacity", self.settings.get("gui.idle_opacity", 0.85)))
+            self._opacity_before_low_spec = max(0.35, min(1.0, cur_alpha))
+
+            # 2) 알파 1.0 강제 + 슬라이더 비활성
+            try:
+                self._current_opacity = 1.0
+                self.idle_alpha = 1.0
+                self._set_alpha_if_needed(1.0, update_idle=True, force=True, tag="low_spec:on")
+            except Exception:
+                pass
+            try:
+                if slider is not None:
+                    slider.configure(state="disabled")
+            except Exception:
+                pass
+
+            # 3) topmost 강제 OFF
+            try:
+                self.attributes("-topmost", False)
+            except Exception:
+                pass
+
+            # win32 훅 해제
+            try:
+                # win32 훅 해제 (보장 로그)
+                self._ensure_win32_hooks(False)
+            except Exception:
+                pass
+
+            self._low_spec_applied = True
+            try:
+                self._log_gui("저사양 모드가 활성화되었습니다.")
+            except Exception:
+                pass
+            return
+
+        # enabled == False → 복원
+        try:
+            base = self._opacity_before_low_spec
+            if base is None:
+                base = float(self.settings.get("gui.idle_opacity", getattr(self, "_current_opacity", 0.85)))
+            restore = max(0.35, min(1.0, float(base)))
+            self._current_opacity = restore
+            self.idle_alpha = restore
+            self._set_alpha_if_needed(restore, update_idle=True, force=True, tag="low_spec:off")
+        except Exception:
+            pass
+
+        # 슬라이더 활성화 + 노브 위치 복원
+        try:
+            if slider is not None:
+                slider.configure(state="normal")
+                slider.set(self.idle_alpha)
+        except Exception:
+            pass
+
+        # topmost 강제 ON (고정 규칙)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        # win32 훅 재설치
+        try:
+            # win32 훅 재설치 (보장 로그)
+            self._ensure_win32_hooks(True)
+        except Exception:
+            pass
+
+        # 다음 사이클 대비 스냅샷 클리어
+        self._opacity_before_low_spec = None
+        self._low_spec_applied = False
+        try:
+            self._log_gui("저사양 모드가 비활성화되었습니다.")
+        except Exception:
+            pass
+
+    def apply_runtime_perf_settings(self, changed_keys: list[str] | None = None) -> None:
+        """
+        settings_dialog에서 저장 직후 호출.
+        - gui.low_spec: 즉시 on/off
+        - gui.tick_ms: 다음 폴링부터 적용
+        - gui.log_max_lines: 즉시 트리밍 1회
+        """
+        # 1) low_spec 즉시 적용
+        try:
+            low = bool(self.settings.get("gui.low_spec", False))
+            self._toggle_low_spec(low)
+        except Exception:
+            pass
+
+        # 2) 폴링 주기 갱신(다음 after부터 반영)
+        try:
+            new_tick = int(self.settings.get("gui.tick_ms", getattr(self, "_TICK_MS", 250)))
+            self._TICK_MS = max(200, min(new_tick, 1000))
+        except Exception:
+            pass
+
+        # 3) 로그 라인 상한 적용(즉시 1회 정리)
+        try:
+            if hasattr(self, "_trim_log_lines_if_needed"):
+                self._trim_log_lines_if_needed()
+        except Exception:
+            pass
+
     def _force_non_layered_refresh(self) -> None:
         """layered→non-layered 복귀 보장 (희귀 케이스용)."""
         try:
@@ -627,175 +832,187 @@ class OverlayApp(ctk.CTk):
             self.mode_var.set("compact")
 
     def _ui_busy_set(self, busy: bool):
-        """창 이동/리사이즈 등 사용자가 GUI를 만지는 동안 heavy 작업을 늦추기 위한 플래그."""
         store = get_state_store()
 
         if busy:
-            # 즉시 busy ON
             try:
                 store.set_ui_busy(True)
-                # GC 일시 정지
-                try:
-                    self._gc_was_enabled = gc.isenabled()
-                    if self._gc_was_enabled:
-                        gc.disable()
-                except Exception:
-                    pass
             except Exception:
                 pass
             self._alpha_paused = True
 
-            # 220ms 뒤까지 ‘조용하면’ busy를 끈다 → 매 이벤트마다 데드라인만 갱신
-            now = int(time.time() * 1000)
-            self._ui_busy_deadline_ms = now + 300
-
-            # busy 동안 폴링 완전 정지: 예약되어 있으면 취소
-            if getattr(self, "_poll_after_id", None):
-                try:
-                    self.after_cancel(self._poll_after_id)
-                except Exception:
-                    pass
-                self._poll_after_id = None
-
-            # goal_ui 폴러도 일시 정지
-            if getattr(self, "_goal_ui_after_id", None):
-                try:
-                    self.after_cancel(self._goal_ui_after_id)
-                except Exception:
-                    pass
-                self._goal_ui_after_id = None
-
-            # layered → non-layered 임시 승격 (딱 1회)
+            # 데드라인 갱신
+            now_ms = int(time.time() * 1000)
+            self._ui_busy_deadline_ms = now_ms + 2000  # 하드 워치독: 2초
+            # 폴링 '정지' 대신 '감속': 다음 틱을 느리게 예약(있다면 그대로 두고, 없다면 새로 예약)
             try:
-                v = float(getattr(self, "_current_opacity", 1.0))
-                if (v < 0.999) and (not self._alpha_temp_elevated):
-                    self._alpha_restore_value = v
-                    self.attributes("-alpha", 1.0)
-                    self._last_attr_alpha = None  # ★추가: 이제 non-layered
-                    self._alpha_temp_elevated = True
+                if self._poll_after_id is None:
+                    self._poll_after_id = self.after(400, self._poll_controller)  # 400~500ms 권장
             except Exception:
                 pass
 
-            # 체크 루프가 없으면 하나만 띄운다 (취소/재예약 없음)
-            if not self._ui_busy_off_checker_id:
-                def _check():
+            # goal_ui 폴러도 감속
+            try:
+                if getattr(self, "_goal_ui_after_id", None) is None:
+                    self._goal_ui_after_id = self.after(400, self._goal_ui_poll)
+            except Exception:
+                pass
+
+            # 워치독(2초) — busy 해제 실패 시 강제 복구
+            if self._ui_busy_off_checker_id is None:
+                def _wd():
                     self._ui_busy_off_checker_id = None
                     try:
-                        cur = int(time.time() * 1000)
-                        if cur >= self._ui_busy_deadline_ms:
-                            # busy OFF 확정 → 폴링 1회만 재개
-                            if getattr(self, "_poll_after_id", None) is None:
-                                try:
-                                    self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
-                                except Exception:
-                                    self._poll_after_id = None
-
-                            # OFF 확정
-                            try:
-                                store.set_ui_busy(False)
-                                # goal_ui 폴러 재개(중복 예약 방지)
-                                if getattr(self, "_goal_ui_after_id", None) is None:
-                                    try:
-                                        self._goal_ui_after_id = self.after(300, self._goal_ui_poll)
-                                    except Exception:
-                                        self._goal_ui_after_id = None
-
-                                # GC 복구 + 즉시 수거(짧게)
-                                try:
-                                    if not gc.isenabled() and self._gc_was_enabled:
-                                        gc.enable()
-                                    gc.collect(0)
-                                    gc.collect(1)
-                                except Exception:
-                                    pass
-
-                                # 임시 승격 복구
-                                try:
-                                    if self._alpha_temp_elevated:
-                                        self._alpha_temp_elevated = False
-                                        rv = self._alpha_restore_value
-                                        self._alpha_restore_value = None
-                                        if isinstance(rv, (int, float)) and rv < 0.999:
-                                            self.attributes("-alpha", float(rv))
-                                            self._last_attr_alpha = float(rv)  # ★추가: layered 복귀
-                                        else:
-                                            self.attributes("-alpha", 1.0)
-                                            self._last_attr_alpha = None  # ★추가: non-layered
-                                except Exception:
-                                    pass
-
-                            except Exception:
-                                pass
-                            self._alpha_paused = False
-                            # layered 임시해제 복구는 패치 B에서 처리
+                        if not store.is_ui_busy():
                             return
                     except Exception:
                         pass
-                    # 아직 데드라인 안 지남 → 조금 뒤 다시 확인
-                    try:
-                        self._ui_busy_off_checker_id = self.after(120, _check)
-                    except Exception:
-                        pass
+                    now = int(time.time() * 1000)
+                    if now >= getattr(self, "_ui_busy_deadline_ms", 0):
+                        # 강제 복구
+                        try:
+                            store.set_ui_busy(False)
+                        except Exception:
+                            pass
+                        # 폴링 재개(즉시)
+                        try:
+                            if self._poll_after_id is None:
+                                self._poll_after_id = self.after(10, self._poll_controller)
+                        except Exception:
+                            pass
+                    else:
+                        # 아직 데드라인 전이면 200ms 뒤 재확인
+                        self._ui_busy_off_checker_id = self.after(200, _wd)
 
-                self._ui_busy_off_checker_id = self.after(120, _check)
+                self._ui_busy_off_checker_id = self.after(220, _wd)
+
         else:
-            # 외부에서 강제 OFF 요청 시(드물지만) 깔끔히 종료
+            # busy 해제
             try:
                 store.set_ui_busy(False)
             except Exception:
                 pass
             self._alpha_paused = False
-            if self._ui_busy_off_checker_id:
-                try:
-                    self.after_cancel(self._ui_busy_off_checker_id)
-                except Exception:
-                    pass
-                self._ui_busy_off_checker_id = None
+            # 폴링은 정상 주기로 재개(즉시 1회)
+            try:
+                if self._poll_after_id is None:
+                    self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
+            except Exception:
+                pass
 
     def _install_win32_movesize_hooks(self):
-        import sys
+        # 이미 서브클래싱 되어 있으면 No-Op
+        if getattr(self, "_wndproc_installed", False):
+            try:
+                self._log_gui("[win32] install: noop (already installed)")
+            except Exception:
+                pass
+            return
+
+        import sys, time
         if sys.platform != "win32":
             return
+
         import ctypes
         from ctypes import wintypes
-
         user32 = ctypes.windll.user32
+
+        # ← 반드시 시그니처 지정 (64bit 핸들 문제 방지)
         GWL_WNDPROC = -4
-        WM_ENTERSIZEMOVE = 0x0231
-        WM_EXITSIZEMOVE = 0x0232
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = ctypes.c_long
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM,
+                                           wintypes.LPARAM]
 
         WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
         hwnd = wintypes.HWND(self.winfo_id())
 
-        # 원래 WNDPROC 저장
-        orig_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+        # 원래 프로시저 저장
+        orig = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+        if not orig:
+            try:
+                self._log_gui("[win32] install: GetWindowLongPtrW returned NULL")
+            except Exception:
+                pass
+            return
+        self._orig_wndproc = ctypes.c_void_p(orig)
 
-        # 콜백이 GC되지 않도록 보관
+        # 콜백 보관( GC 방지 )
         self._wndproc_ref = None
 
         @WNDPROC
         def _proc(hWnd, msg, wParam, lParam):
             try:
-                if msg == WM_ENTERSIZEMOVE:
-                    # 이동/리사이즈 시작: busy ON (주기 작업/알파 임시 승격 등은 내부에서 처리)
-                    try:
-                        self._ui_busy_set(True)
-                    except Exception:
-                        pass
-                elif msg == WM_EXITSIZEMOVE:
-                    # 이동/리사이즈 종료: busy OFF (내부 데드라인/복구 로직이 있으므로 즉시 OFF 신호만)
-                    try:
-                        self._ui_busy_set(False)
-                    except Exception:
-                        pass
+                if msg == 0x0231:  # WM_ENTERSIZEMOVE
+                    self._ui_busy_set(True)
+                elif msg == 0x0232:  # WM_EXITSIZEMOVE
+                    self._ui_busy_set(False)
             except Exception:
                 pass
-            # 원래 WNDPROC 호출
-            return ctypes.c_long(user32.CallWindowProcW(orig_proc, hWnd, msg, wParam, lParam))
+            return user32.CallWindowProcW(self._orig_wndproc, hWnd, msg, wParam, lParam)
 
-        # 후킹
         self._wndproc_ref = _proc
-        user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, ctypes.cast(_proc, ctypes.c_void_p).value)
+        res = user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, ctypes.cast(_proc, ctypes.c_void_p))
+        if not res:
+            try:
+                self._log_gui("[win32] install: SetWindowLongPtrW failed")
+            except Exception:
+                pass
+            # 실패 시 원상태 유지
+            self._orig_wndproc = None
+            self._wndproc_ref = None
+            return
+
+        # 상태 플래그/타임스탬프/로그
+        self._wndproc_installed = True
+        self._win32_hook_last_ts = time.time()
+
+    def _uninstall_win32_hooks(self) -> None:
+        if not getattr(self, "_wndproc_installed", False):
+            try:
+                self._log_gui("[win32] uninstall: noop (not installed)")
+            except Exception:
+                pass
+            return
+        import sys, time
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        GWL_WNDPROC = -4
+        hwnd = wintypes.HWND(self.winfo_id())
+        try:
+            if self._orig_wndproc:
+                user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, self._orig_wndproc)
+        except Exception:
+            pass
+        # 상태 초기화
+        self._wndproc_installed = False
+        self._orig_wndproc = None
+        self._wndproc_ref = None
+        self._win32_hook_last_ts = time.time()
+
+    def _apply_low_spec_profile(self) -> None:
+        # 불투명도/TopMost 완화
+        try:
+            self._current_opacity = 1.0
+            self.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+        try:
+            # low_spec에서는 topmost를 강제 off
+            self.attributes("-topmost", False)
+        except Exception:
+            pass
+        # 틱 주기 보수적으로 상향 (설정값 기준, 최소 300ms)
+        try:
+            self._TICK_MS = max(int(self.settings.get("gui.tick_ms", self._TICK_MS)), 300)
+        except Exception:
+            self._TICK_MS = max(self._TICK_MS, 300)
 
     def _track_pointer_alpha(self):
         """[DEPRECATED] 이벤트 드리븐으로 대체됨. 호환용 더미."""
@@ -858,6 +1075,7 @@ class OverlayApp(ctk.CTk):
                 return
             if self.controller.start():
                 stop_event.clear()  # ★ 추가: 이전 F12(중지) 잔류 해제
+                self.controller.reset_runtime_state()
                 start_event.set()  # ✅ 루틴 쓰레드에 시작 신호
                 self.stop_hold.set_running(True)
             return
@@ -865,6 +1083,7 @@ class OverlayApp(ctk.CTk):
         # 켜고 시작(위) 또는 그냥 시작(아래)
         if self.controller.start():
             stop_event.clear()  # ★ 추가: 일반 경로도 동일 처리
+            self.controller.reset_runtime_state()
             start_event.set()
             self.stop_hold.set_running(True)
 
@@ -877,6 +1096,7 @@ class OverlayApp(ctk.CTk):
             pass
         self.controller.stop()
         self.stop_hold.set_running(False)
+        self.controller.reset_runtime_state()
 
     def _poll_controller(self):
         # ── 재진입 가드 ──
@@ -902,6 +1122,46 @@ class OverlayApp(ctk.CTk):
                     self._set_state_color(disp)
                     self._last_state_disp = disp
                     self.stop_hold.set_running(disp == "RUNNING")
+                    # 상태표시/버튼 상태 변경 직후에 추가
+                    try:
+                        if disp == "RUNNING":
+                            # 토글/편집 비활성, 콤보는 선택 가능
+                            try:
+                                self.sw_goal.configure(state="disabled")
+                            except Exception:
+                                pass
+                            try:
+                                self.btn_goal_edit.configure(state="disabled")
+                            except Exception:
+                                pass
+                            try:
+                                # 콤보는 항상 'readonly' 유지(=선택 가능)
+                                self.combo_goal.configure(state="readonly")
+                            except Exception:
+                                pass
+                            try:
+                                self.btn_calib.configure(state="disabled")
+                            except Exception:
+                                pass
+                        else:  # IDLE
+                            try:
+                                self.sw_goal.configure(state="normal")
+                            except Exception:
+                                pass
+                            try:
+                                self.btn_goal_edit.configure(state="normal")
+                            except Exception:
+                                pass
+                            try:
+                                self.combo_goal.configure(state="readonly")
+                            except Exception:
+                                pass
+                            try:
+                                self.btn_calib.configure(state="normal")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
             # 가능하면 여러 줄을 모아서 1회 삽입
             tick_budget_ms = 3.0  # 틱당 최대 3ms만 소비 (필요시 2~5 조정)
@@ -920,6 +1180,7 @@ class OverlayApp(ctk.CTk):
                 buf = "".join(l + "\n" for l in lines)
                 self.log.configure(state="normal")
                 self.log.insert("end", buf, ("base",))
+                self._trim_log_lines_if_needed()
                 self.log.see("end")
                 self.log.configure(state="disabled")
         finally:
@@ -945,6 +1206,20 @@ class OverlayApp(ctk.CTk):
                 pass
 
         self.after(0, _do)  # ✅ 메인스레드에서만 수행
+
+    def _trim_log_lines_if_needed(self):
+        try:
+            max_lines = int(self.settings.get("gui.log_max_lines", 800))
+            # 'end-1c' 인덱스에서 라인 수 추출
+            total = int(float(self.log.index("end-1c").split(".")[0]))
+            if total > max_lines:
+                # 초과분 만큼 맨 앞 라인 삭제
+                cut = total - max_lines
+                self.log.configure(state="normal")
+                self.log.delete("1.0", f"{cut + 1}.0")
+                self.log.configure(state="disabled")
+        except Exception:
+            pass
 
     def _set_state_color(self, s: str):
         # 표시 상태(IDLE/RUNNING)에만 맞춰 색상 결정
@@ -985,6 +1260,34 @@ class OverlayApp(ctk.CTk):
                 print(msg)
 
         self.after(0, _do)
+
+    # === [ADD] main.set_status_logger 브릿지 ===
+    def log_status(self, text: str, fg: str | None = None) -> None:
+        """
+        main 쪽에서 (text, fg)로 호출. fg는 'cyan bold' / '#00BCD4|bold' 등 토큰 조합 허용.
+        """
+        tagset = {"base"}
+        if isinstance(fg, str):
+            tokens = fg.replace("|", " ").replace(";", " ").replace(",", " ").lower().split()
+            for tk in tokens:
+                if tk in ("green", "#16a34a"):
+                    tagset.add("green")
+                elif tk in ("amber", "#f59e0b"):
+                    tagset.add("amber")
+                elif tk in ("gray", "grey", "#9ca3af"):
+                    tagset.add("gray")
+                elif tk in ("red", "#ef4444"):
+                    tagset.add("red")
+                elif tk in ("cyan", "#00bcd4"):
+                    tagset.add("cyan")
+                elif tk in ("bold",):
+                    tagset.add("bold")
+
+        # 태그가 하나도 매칭되지 않으면 기본 로그
+        if tagset == {"base"}:
+            self._log_gui(text)
+        else:
+            self._log_colored(text, *sorted(tagset))
 
     def _log_startup_goal_and_hotkey(self):
         """
@@ -1052,6 +1355,9 @@ class OverlayApp(ctk.CTk):
         self._goal_ui_after_id = None
 
     def _set_goal_controls_enabled(self, enabled: bool):
+        if getattr(self, "_goal_controls_enabled_cache", None) == enabled:
+            return
+        self._goal_controls_enabled_cache = enabled
         try:
             self.sw_goal.configure(state="normal" if enabled else "disabled")
             self.combo_goal.configure(state="readonly" if enabled else "disabled")
@@ -1082,11 +1388,26 @@ class OverlayApp(ctk.CTk):
         )
         preset_names = [goal_presets[pid].get("name", pid) for pid in ordered_ids]
 
-        active_id = self.settings.get("goal.active_preset_id", ordered_ids[0] if ordered_ids else "")
+        # ★ 활성 프리셋 보정: 없으면 p1, 그것도 없으면 첫 번째
+        active_id = self.settings.get("goal.active_preset_id", "")
+        if active_id not in goal_presets:
+            if "p1" in goal_presets:
+                active_id = "p1"
+            elif ordered_ids:
+                active_id = ordered_ids[0]
+            else:
+                active_id = ""
+            if active_id:
+                try:
+                    self.settings.set("goal.active_preset_id", active_id)
+                    self.settings.queue_save()
+                except Exception:
+                    pass
+
         active_name = goal_presets.get(active_id, {}).get("name", active_id)
 
         try:
-            self.combo_goal.configure(values=preset_names, state="readonly" if preset_names else "disabled")
+            self.combo_goal.configure(values=preset_names, state=("readonly" if preset_names else "disabled"))
             if active_name:
                 self.combo_goal.set(active_name)
         except Exception:
@@ -1105,6 +1426,16 @@ class OverlayApp(ctk.CTk):
         self._on_goal_toggle()
 
     def _on_goal_toggle(self):
+        # RUNNING 상태에서는 토글 금지 + 즉시 되돌림
+        if self.controller.is_running():
+            try:
+                # 직전 상태로 롤백
+                self.var_goal_enabled.set(bool(self.settings.get("goal.enabled", False)))
+                messagebox.showinfo("변경 불가", "실행 중에는 목표 토글을 변경할 수 없습니다.", parent=self)
+            except Exception:
+                pass
+            return
+
         enabled = self.var_goal_enabled.get()
         g = self.settings.get("goal", {})
         pid = g.get("active_preset_id", "p1")
@@ -1158,15 +1489,41 @@ class OverlayApp(ctk.CTk):
                 return
 
         self.settings.set("goal.enabled", enabled)
-        self.settings.save()
+        # 원자 저장(가능하면 save_strict 사용)
+        if hasattr(self.settings, "save_strict"):
+            self.settings.save_strict()
+        else:
+            self.settings.save()
+
+        # [NEW] 스케줄 변경이 아니어도 안전: 저장 직후 메인에 재적용 시그널
+        try:
+            import main as _main
+            if hasattr(_main, "reload_scheduled_shutdown"):
+                _main.reload_scheduled_shutdown()
+        except Exception:
+            pass
+
+        # 디스크 재조회로 검증
+        try:
+            ok = (bool(self.settings.get("goal.enabled", not enabled)) == bool(enabled))
+        except Exception:
+            ok = False
+        if not ok:
+            # 저장이 반영되지 않았으면 UI 롤백 + 경고
+            self.var_goal_enabled.set(not bool(enabled))
+            self._log_colored("[goal] 저장 검증 실패 → 토글 원복", "red")
+            messagebox.showwarning("저장 오류", "설정 저장 직후 일치 확인에 실패했습니다.", parent=self)
+            return
+
         try:
             self.goal_provider.set_enabled(bool(enabled))
         except Exception:
             pass
 
-        # [ADD] UI/로그 동기화
+        # UI/로그 동기화
         self._sync_goal_visual()
         self._log_colored(f"목표달성 모드: {'ON' if enabled else 'OFF'}", "green" if enabled else "amber")
+        self.controller.reset_runtime_state()
 
     def _validate_goal_ready(self) -> tuple[bool, str]:
         """
@@ -1222,13 +1579,22 @@ class OverlayApp(ctk.CTk):
         if not target_pid:
             return
         self.settings.set("goal.active_preset_id", target_pid)
-        self.settings.save()
+        self.settings.queue_save()
+
         try:
             self.goal_provider.apply_active_preset()
         except Exception:
             pass
 
     def _on_goal_edit(self):
+        # ★ RUNNING 가드
+        if getattr(self.controller, "is_running", lambda: False)():
+            try:
+                messagebox.showwarning("편집 불가", "루틴 실행 중에는 프리셋 편집을 할 수 없습니다.", parent=self)
+            except Exception:
+                pass
+            return
+
         prev_top = True
         try:
             prev_top = bool(self.attributes("-topmost"))
@@ -1239,7 +1605,7 @@ class OverlayApp(ctk.CTk):
         # ── 추가: 편집기 띄우는 동안 알파 트래킹 일시 정지 ──
         try:
             if hasattr(self, "set_alpha_tracking_enabled"):
-                self.set_alpha_tracking_enabled(False)  # ★ add
+                self.set_alpha_tracking_enabled(False)
         except Exception:
             pass
 
@@ -1257,7 +1623,7 @@ class OverlayApp(ctk.CTk):
         # ── 복귀: 알파 트래킹 재개 ──
         try:
             if hasattr(self, "set_alpha_tracking_enabled"):
-                self.set_alpha_tracking_enabled(True)  # ★ add
+                self.set_alpha_tracking_enabled(True)
         except Exception:
             pass
 
@@ -1266,23 +1632,81 @@ class OverlayApp(ctk.CTk):
         except Exception:
             pass
 
+        # 설정 재적용
         try:
             self.goal_provider.reload_from_settings()
         except Exception:
             pass
+
+        # ★ 활성 프리셋 보정: 현재 active_id가 삭제되었으면 p1(있으면)로 강제
         try:
-            self._refresh_goal_combo()
+            goal = self.settings.get("goal", {}) or {}
+            presets = goal.get("presets", {}) or {}
+            active_id = goal.get("active_preset_id", "")
+            if active_id not in presets:
+                new_id = "p1" if "p1" in presets else (sorted(presets.keys())[0] if presets else "")
+                if new_id:
+                    self.settings.set("goal.active_preset_id", new_id)
+                    self.settings.save()
         except Exception:
             pass
 
         try:
-            self._sync_goal_visual()  # ★ add
+            self._refresh_goal_combo()
+        except Exception:
+            pass
+        try:
+            self._sync_goal_visual()
         except Exception:
             pass
 
     # ------------------------------------------------------------------
     # 설정/좌표/검증
     # ------------------------------------------------------------------
+    # === 저장 버튼 하이브리드 핸들러 ===
+    def _on_save_click(self, btn):
+        if getattr(self, "_save_in_progress", False):
+            return
+        self._save_in_progress = True
+        try:
+            btn.configure(state="disabled", text="저장 중…")
+        except Exception:
+            pass
+
+        import threading
+
+        def _work():
+            try:
+                # 즉시 커밋(버튼 저장은 지연 없이 확정)
+                self.settings.flush_debounced(immediate=True)
+            finally:
+                # UI 복귀는 메인 스레드
+                try:
+                    self.after(0, lambda: self._after_save_ui(btn))
+                except Exception:
+                    self._save_in_progress = False
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _after_save_ui(self, btn):
+        try:
+            btn.configure(text="저장됨 ✓")
+        except Exception:
+            pass
+
+        # 1.2s 후 원복 + 재활성화
+        def _restore():
+            try:
+                btn.configure(text="저장", state="normal")
+            except Exception:
+                pass
+            self._save_in_progress = False
+
+        try:
+            self.after(1200, _restore)
+        except Exception:
+            _restore()
+
     def _open_roi_editor(self):
         """
         ROI 편집기(풀스크린, 원본 좌표) 실행.
@@ -1342,7 +1766,15 @@ class OverlayApp(ctk.CTk):
     def _open_verify(self):
         """좌표 확인 뷰어(싱글턴). 열려 있으면 내용만 갱신."""
         # --- 메인 GUI 일시 숨김(overlay 모드 진입) → 캡처 → 즉시 복원 ---
-        ctx = self._enter_overlay_mode()   # ← 메인 창 withdraw + 폴링/알파 중지
+        # RUNNING 중엔 테스트 진입 금지
+        if getattr(self.controller, "is_running", lambda: False)():
+            try:
+                messagebox.showwarning("테스트 불가", "루틴 실행 중에는 OCR 테스트를 할 수 없습니다.", parent=self)
+            except Exception:
+                pass
+            return
+
+        ctx = self._enter_overlay_mode()  # ← 메인 창 withdraw + 폴링/알파 중지
         try:
             # compositor 안정화 약간 대기 (필요 최소)
             try:
@@ -1739,7 +2171,7 @@ class OverlayApp(ctk.CTk):
 
         node["screen"] = {"w": int(sw), "h": int(sh)}
         self.settings.set("ocr", node)
-        self.settings.save()
+        self.settings.queue_save()
 
         # 저장 후 버튼 상태 갱신
         try:
@@ -1753,6 +2185,7 @@ class OverlayApp(ctk.CTk):
         - 존재하지 않는 ROI는 [0,0,0,0]로 저장해 '없음'을 명시적으로 기록
         - 화면 크기도 함께 갱신
         """
+
         def to_xywh(xyxy):
             if not xyxy:
                 return [0, 0, 0, 0]
@@ -1767,11 +2200,11 @@ class OverlayApp(ctk.CTk):
 
         node = self.settings.get("ocr", {}) or {}
         node["roi_points"] = to_xywh(points_xyxy)
-        node["roi_rank"]   = to_xywh(rank_xyxy)
+        node["roi_rank"] = to_xywh(rank_xyxy)
         node["screen"] = {"w": int(sw), "h": int(sh)}
 
         self.settings.set("ocr", node)
-        self.settings.save()
+        self.settings.queue_save()
 
         # '좌표 확인' 버튼 상태 갱신
         try:
@@ -1812,7 +2245,7 @@ class OverlayApp(ctk.CTk):
                     pass
 
                 self.settings.set("gui._last_geometry", self.geometry())
-                self.settings.save()
+                self.settings.flush_debounced(immediate=True)
             except Exception:
                 pass
             # 전역 핫키 해제(등록 실패했더라도 안전)
@@ -1820,6 +2253,12 @@ class OverlayApp(ctk.CTk):
                 self._hotkeys.unregister()
             except Exception:
                 pass
+
+            try:
+                self._uninstall_win32_hooks()
+            except Exception:
+                pass
+
             self.destroy()
 
 
@@ -1996,12 +2435,12 @@ class RoiEditorOverlay(tk.Toplevel):
         self.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
         self.grab_set()
 
-        self.bg_img = self._grab_fullscreen_pil()                  # 원본 해상도 캡처(1회)
+        self.bg_img = self._grab_fullscreen_pil()  # 원본 해상도 캡처(1회)
         self.bg_dim = ImageEnhance.Brightness(self.bg_img).enhance(self._BG_DIM)  # 너무 어두우면 0.5→0.85로 가독성 확보
         self._bg_tk = ImageTk.PhotoImage(self.bg_dim)
 
         # ▼ 스포트라이트(원본 크롭) 이미지 캐시
-        self._spot_imgs_tk = []   # PhotoImage GC 방지용
+        self._spot_imgs_tk = []  # PhotoImage GC 방지용
         self._spot_item_ids = []  # 캔버스 아이템 id들
 
         # ── 캔버스 구성 ──
@@ -2733,9 +3172,11 @@ class RoiEditorOverlay(tk.Toplevel):
         if not r:
             return
         x1, y1, x2, y2 = r
-        nx1, ny1, nx2, ny2 = x1+dx, y1+dy, x2+dx, y2+dy
-        nx1 = max(0, min(self.screen_w-1, nx1)); nx2 = max(1, min(self.screen_w, nx2))
-        ny1 = max(0, min(self.screen_h-1, ny1)); ny2 = max(1, min(self.screen_h, ny2))
+        nx1, ny1, nx2, ny2 = x1 + dx, y1 + dy, x2 + dx, y2 + dy
+        nx1 = max(0, min(self.screen_w - 1, nx1));
+        nx2 = max(1, min(self.screen_w, nx2))
+        ny1 = max(0, min(self.screen_h - 1, ny1));
+        ny2 = max(1, min(self.screen_h, ny2))
         if nx2 <= nx1 + 1 or ny2 <= ny1 + 1:
             return
         self.roi[self._selected] = (nx1, ny1, nx2, ny2)
@@ -2836,10 +3277,10 @@ class RoiEditorOverlay(tk.Toplevel):
             pass
 
     def _clamp_rect(self, x1, y1, x2, y2):
-        x1 = max(0, min(self.screen_w-1, x1))
-        y1 = max(0, min(self.screen_h-1, y1))
-        x2 = max(1, min(self.screen_w,   x2))
-        y2 = max(1, min(self.screen_h,   y2))
+        x1 = max(0, min(self.screen_w - 1, x1))
+        y1 = max(0, min(self.screen_h - 1, y1))
+        x2 = max(1, min(self.screen_w, x2))
+        y2 = max(1, min(self.screen_h, y2))
         # 정규화
         if x2 < x1: x1, x2 = x2, x1
         if y2 < y1: y1, y2 = y2, y1
@@ -2851,7 +3292,7 @@ class RoiEditorOverlay(tk.Toplevel):
 
     def _handle_positions(self, r):
         x1, y1, x2, y2 = [int(v) for v in r]
-        cx, cy = (x1 + x2)//2, (y1 + y2)//2
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         return {
             "nw": (x1, y1), "n": (cx, y1), "ne": (x2, y1),
             "e": (x2, cy), "se": (x2, y2), "s": (cx, y2),
@@ -2877,11 +3318,15 @@ class RoiEditorOverlay(tk.Toplevel):
         if "e" in h: x2 = mx
         x1, y1, x2, y2 = self._clamp_rect(x1, y1, x2, y2)
         if (x2 - x1) < self._MIN_W:  # 최소 폭
-            if "w" in h: x1 = x2 - self._MIN_W
-            else:        x2 = x1 + self._MIN_W
+            if "w" in h:
+                x1 = x2 - self._MIN_W
+            else:
+                x2 = x1 + self._MIN_W
         if (y2 - y1) < self._MIN_H:  # 최소 높이
-            if "n" in h: y1 = y2 - self._MIN_H
-            else:        y2 = y1 + self._MIN_H
+            if "n" in h:
+                y1 = y2 - self._MIN_H
+            else:
+                y2 = y1 + self._MIN_H
         self.roi[self._selected] = (x1, y1, x2, y2)
 
     def _build_bottom_hint(self):
@@ -3218,7 +3663,7 @@ def _ocr_digits_with_fallback(pil_img):
         if callable(rr):
             try:
                 raw_rr = str(rr(pil_img) or "")
-                if raw_rr:            # 전용 탐지 성공(문구 일부라도 잡힘)
+                if raw_rr:  # 전용 탐지 성공(문구 일부라도 잡힘)
                     return (None, raw_rr)
             except Exception:
                 pass
@@ -3326,7 +3771,7 @@ def _run_calib_ocr_and_render(parent_window, result_label, pil_img):
             pass
         return tuple(map(int, xyxy))
 
-    pts_xyxy  = _scale_xyxy(rois_xyxy.get("roi_points"))
+    pts_xyxy = _scale_xyxy(rois_xyxy.get("roi_points"))
     rank_xyxy = _scale_xyxy(rois_xyxy.get("roi_rank"))
 
     # 2) 크롭

@@ -4,7 +4,9 @@ import threading
 import customtkinter as ctk
 from tkinter import messagebox
 import autoemail
-from path_manager import BASE_DIR  # ← 추가
+from path_manager import BASE_DIR, get_img_path  # ← 추가
+from PIL import Image, ImageEnhance
+from pathlib import Path
 
 GMAIL = "@gmail.com"
 NAVER = "@naver.com"
@@ -20,6 +22,21 @@ DISABLED_PLACEHOLDER   = ("#9A9A9A", "#6E6E6E")  # ★ placeholder(Entry/Textbox
 DISABLED_LABEL_TEXT    = ("#A0A0A0", "#6A6A6A")  # 좌측 라벨(예: "메일 제목")
 DISABLED_FG            = ("#2A2A2A", "#1E1E1E")  # 배경(너가 쓰던 값)
 DISABLED_BORDER        = ("#3A3A3A", "#303030")  # 테두리(너가 쓰던 값)
+
+# 스팸 모드에서 허용할 키 목록 (pyautogui/keyboard에 매핑 가능한 이름으로 유지)
+ALLOWED_SPAM_KEYS: list[str] = [
+    # 문자/숫자
+    "s","a","d","f","q","w","e","r","1","2","3","4","5","6","7","8","9","0",
+    # 특수/제어
+    "space","enter","esc","tab","backspace",
+    # 화살표
+    "up","down","left","right",
+]
+
+# 세로(height) 기준 축소, 가로는 비율로 계산 (너비 상한만 둠)
+SPAM_THUMB_H      = 72
+SPAM_THUMB_MAX_W  = 140
+SPAM_THUMB_DIM    = 0.45
 
 
 # ---------- CTkTextbox placeholder (Entry와 동일 UX) ----------
@@ -196,6 +213,7 @@ class PlaceholderText(ctk.CTkTextbox):
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, settings_manager, email_queue):
         super().__init__(parent)
+        self.owner = parent
         self.title("설정")
         self.geometry("980x620")
         self.minsize(960, 600)
@@ -208,16 +226,51 @@ class SettingsDialog(ctk.CTkToplevel):
         root = ctk.CTkFrame(self); root.pack(fill="both", expand=True, padx=10, pady=10)
         root.grid_columnconfigure(1, weight=1); root.grid_rowconfigure(0, weight=1)
 
-        self.tabbar = ctk.CTkFrame(root, width=220); self.tabbar.grid(row=0, column=0, sticky="nsw", padx=(0,10))
-        self.content = ctk.CTkFrame(root);           self.content.grid(row=0, column=1, sticky="nsew")
+        self.tabbar = ctk.CTkFrame(root, width=220)
+        self.tabbar.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        self.content = ctk.CTkFrame(root)
+        self.content.grid(row=0, column=1, sticky="nsew")
 
-        ctk.CTkButton(self.tabbar, text="이메일 설정", command=self._show_email_tab).pack(fill="x", pady=(0,6))
+        # ─ 탭 버튼들 ─
+        ctk.CTkButton(self.tabbar, text="이메일 설정", command=self._show_email_tab).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(self.tabbar, text="성능(저사양)", command=self._show_perf_tab).pack(fill="x", pady=(0, 6))
+        # [ADD] 예약 종료 탭
+        ctk.CTkButton(self.tabbar, text="예약 종료", command=self._show_schedule_tab).pack(fill="x", pady=(0, 6))
+        # [ADD] 스팸 모드 탭
+        ctk.CTkButton(self.tabbar, text="스팸 모드", command=self._show_spam_tab).pack(fill="x", pady=(0, 6))
 
+        # ─ 페이지들 ─
         self.page_email = ctk.CTkFrame(self.content)
         self.page_email.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.page_perf = ctk.CTkFrame(self.content)
+        self.page_perf.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # [ADD] 예약 종료 페이지
+        self.page_schedule = ctk.CTkFrame(self.content)
+        self.page_schedule.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # [ADD] 스팸 모드 페이지
+        self.page_spam = ctk.CTkFrame(self.content)
+        self.page_spam.place(relx=0, rely=0, relwidth=1, relheight=1)
 
+        # 스팸 탭에서 쓸 이미지 리스트 선로딩
+        self._ensure_spam_choices_loaded()  # 없으면 새로 추가될 함수
+
+        # ─ 빌드 ─
         self._build_email_page(self.page_email)
+        self._build_perf_page(self.page_perf)
+        # [ADD]
+        self._build_schedule_page(self.page_schedule)
+        # [ADD] 스팸 모드 빌드
+        self._build_spam_page(self.page_spam)
+
+        # (안전) 초기 프리뷰 동기화
+        try:
+            self._update_spam_preview_all()
+        except Exception:
+            pass
+
+        # 기본 표시 탭은 기존과 동일
         self._show_email_tab()
+
         # (프리셋 페이지/빌더 호출 제거)
 
         self._parent_app = parent
@@ -228,6 +281,124 @@ class SettingsDialog(ctk.CTkToplevel):
             pass
 
         self.protocol("WM_DELETE_WINDOW", self._maybe_close)
+
+    # --- Topmost 계층 관리 유틸 ---
+    def _push_topmost(self):
+        """현재 창이 topmost면 스택에 추가하고 일시적으로 해제."""
+        try:
+            if not hasattr(self, "_topmost_stack"):
+                self._topmost_stack = []
+            was_top = bool(int(self.wm_attributes("-topmost")))
+            self._topmost_stack.append(was_top)
+            if was_top:
+                self.attributes("-topmost", False)
+            return was_top
+        except Exception:
+            return False
+
+    def _pop_topmost(self):
+        """스택에 있던 topmost 상태를 복원."""
+        try:
+            if hasattr(self, "_topmost_stack") and self._topmost_stack:
+                prev = self._topmost_stack.pop()
+                if prev:
+                    self.attributes("-topmost", True)
+                    self.lift()
+                    self.focus_force()
+        except Exception:
+            pass
+
+    def _force_front(self):
+        """설정창을 확실히 앞으로 끌어올린다(윈도우/CTk 테마별 이슈 방지용)."""
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            # 메시지 큐 타이밍 차이 대비 더블 리프트
+            self.after(0, lambda: (self.lift(), self.focus_force()))
+            self.after(60, lambda: (self.lift(), self.focus_force()))
+        except Exception:
+            pass
+
+    def _raise_self_front(self):
+        """모달 종료 후 '메인 설정' 창을 확실히 최상단/포커스로 복귀."""
+        try:
+            # 1) 즉시 앞으로 끌어올리고 포커스/모달 그랩 복구
+            self.lift()
+            self.focus_force()
+            self.grab_set()  # SettingsDialog가 다시 모달처럼 동작
+
+            # 2) topmost 디더링으로 z-order 재배열
+            self.attributes("-topmost", False)
+            # WM에 반영될 틱을 약간 준 뒤 다시 ON
+            self.after(10, lambda: self.attributes("-topmost", True))
+
+            # 3) 마지막으로 한 번 더 lift (안전핀)
+            self.after(15, self.lift)
+        except Exception:
+            pass
+
+    def _lower_main_owner_once(self):
+        """메인 GUI가 topmost면 잠시 내려서 순서를 확정해 준다(잠깐 내렸다가 복원)."""
+        try:
+            owner = getattr(self, "owner", None) or getattr(self, "master", None)
+            if owner is None:
+                return
+            t = owner.wm_attributes("-topmost")
+            owner_is_top = (int(t) == 1) if isinstance(t, (int, str)) else bool(t)
+            if owner_is_top:
+                owner.attributes("-topmost", False)
+                # 우리가 앞으로 온 뒤 원복
+                self.after(100, lambda: owner.attributes("-topmost", True))
+        except Exception:
+            pass
+
+    def _restore_after_child_close(self):
+        """
+        자식 모달이 닫힌 ‘직후’ 호출.
+        메인 GUI가 always-on-top 여도, 설정창을 즉시 최상단/포커스로 복귀시킨다.
+        """
+        try:
+            owner = getattr(self, "owner", None) or getattr(self, "master", None)
+            owner_is_top = False
+            if owner is not None:
+                try:
+                    t = owner.wm_attributes("-topmost")
+                    owner_is_top = (int(t) == 1) if isinstance(t, (int, str)) else bool(t)
+                except Exception:
+                    owner_is_top = False
+
+            # 1) 메인을 잠시 내리고
+            if owner_is_top:
+                try:
+                    owner.attributes("-topmost", False)
+                except Exception:
+                    pass
+
+            # 2) 설정창을 강제로 최상단 + 포커스 + grab
+            try:
+                self.attributes("-topmost", True)
+                self.lift()
+                self.focus_force()
+                self.grab_set()
+            except Exception:
+                pass
+
+            # 3) 메시지 큐가 정리된 뒤 한 번 더 올려 확정
+            try:
+                self.after(30, lambda: (self.lift(), self.focus_force()))
+            except Exception:
+                pass
+
+            # 4) 메인을 원복(있던 사람만), 그리고 마지막으로 설정창을 한 번 더 올려 순서를 고정
+            if owner_is_top:
+                try:
+                    self.after(80, lambda: owner.attributes("-topmost", True))
+                    self.after(90, lambda: (self.lift(), self.focus_force()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ------- settings helpers -------
     def _refresh_entry_placeholder(self, entry_widget):
@@ -769,6 +940,1176 @@ class SettingsDialog(ctk.CTkToplevel):
         self._mark_dirty(False)  # 저장 버튼 비활성화로 시작
         self._apply_subject_section_visibility()
 
+    def _build_perf_page(self, parent):
+        pad = {"padx": 8, "pady": 6}
+
+        # 상단 고정 바(옵션 설명)
+        top = ctk.CTkFrame(parent)
+        top.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        ctk.CTkLabel(top, text="저사양 장치 대응 옵션 (UI 부하/로그량 조절)").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        # 스크롤러 (본문)
+        container = ctk.CTkScrollableFrame(parent)
+        container.grid(row=1, column=0, sticky="nsew")
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # 현재 설정값 로드
+        low_spec = bool(self.settings.get("gui.low_spec", False))
+        tick_ms = int(self.settings.get("gui.tick_ms", 250))
+        max_lines = int(self.settings.get("gui.log_max_lines", 800))
+
+        # 위젯들
+        self.var_low_spec = ctk.BooleanVar(value=low_spec)
+        self.chk_low_spec = ctk.CTkCheckBox(container, text="저사양 모드 활성화", variable=self.var_low_spec,
+                                            command=self._on_perf_change)
+        self.chk_low_spec.grid(row=0, column=0, sticky="w", **pad)
+
+        row = 1
+        ctk.CTkLabel(container, text="GUI 폴링 주기(ms) : [숫자가 높을수록 저사양]").grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+        self.ent_tick_ms = ctk.CTkEntry(container, width=120)
+        self.ent_tick_ms.insert(0, str(tick_ms))
+        self.ent_tick_ms.grid(row=row, column=0, sticky="w", **pad)
+        self.ent_tick_ms.bind("<KeyRelease>", self._on_perf_change)
+        row += 1
+
+        ctk.CTkLabel(container, text="로그 최대 라인 수").grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+        self.ent_log_lines = ctk.CTkEntry(container, width=120)
+        self.ent_log_lines.insert(0, str(max_lines))
+        self.ent_log_lines.grid(row=row, column=0, sticky="w", **pad)
+        self.ent_log_lines.bind("<KeyRelease>", self._on_perf_change)
+        row += 1
+
+        ctk.CTkLabel(container, text="권장값: 폴링 250~350ms / 로그 800~2000 라인").grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        # 하단 고정 바(버튼들)
+        bar = ctk.CTkFrame(parent)
+        bar.grid(row=2, column=0, sticky="ew", padx=0, pady=(4, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        self.lbl_perf_status = ctk.CTkLabel(bar, text="", text_color=("gray70", "gray40"))
+        self.lbl_perf_status.grid(row=0, column=0, sticky="w", padx=(8, 0))
+
+        self.btn_perf_save = ctk.CTkButton(bar, text="저장", width=120, command=self._on_save_perf, state="disabled")
+        self.btn_perf_close = ctk.CTkButton(bar, text="닫기", width=120, command=self._maybe_close)
+        self.btn_perf_save.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.btn_perf_close.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        # 베이스라인 스냅샷 저장
+        self._perf_baseline = self._snapshot_perf_ui()
+
+    def _build_schedule_page(self, parent):
+        pad = {"padx": 8, "pady": 6}
+        top = ctk.CTkFrame(parent)
+        top.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        ctk.CTkLabel(top, text="예약 종료 설정 (요일/시간 1건 + 경기 종료 후 지연 종료)").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        container = ctk.CTkFrame(parent);
+        container.grid(row=1, column=0, sticky="nsew")
+        parent.grid_rowconfigure(1, weight=1);
+        parent.grid_columnconfigure(0, weight=1)
+
+        # 현재 설정 로드
+        sched = self.settings.get("schedule", {}) or {}
+        enabled = bool(sched.get("enabled", False))
+        entries = (sched.get("entries") or [])
+        entry = (entries[0] if entries else {"weekday": "mon", "hour": 3, "min": 0})
+        delay_min = int(sched.get("shutdown_delay_min", 20))
+        auto_off = bool(sched.get("auto_poweroff", True))
+
+        # 한글↔키 매핑
+        self._wday_to_key = {"월": "mon", "화": "tue", "수": "wed", "목": "thu", "금": "fri", "토": "sat", "일": "sun"}
+        self._key_to_wday = {v: k for k, v in self._wday_to_key.items()}
+        wday_label = self._key_to_wday.get(str(entry.get("weekday", "mon")), "월")
+
+        # 위젯
+        row = 0
+        self.var_sched_enabled = ctk.BooleanVar(value=enabled)
+        # 토글 시: (1) UI enable/disable 적용 → (2) 변경 감지
+        self.chk_sched_enabled = ctk.CTkCheckBox(
+            container, text="예약 종료 활성화", variable=self.var_sched_enabled,
+            command=lambda: (self._apply_schedule_enabled_state(), self._on_schedule_change())
+        )
+        self.chk_sched_enabled.grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        # 요일/시/분
+        # 라벨 참조 보관(비활성화 시 디밍용)
+        self.lbl_wday_time = ctk.CTkLabel(container, text="요일 / 시각")
+        self.lbl_wday_time.grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        self.cbo_wday = ctk.CTkOptionMenu(container, values=["월", "화", "수", "목", "금", "토", "일"],
+                                          command=lambda *_: self._on_schedule_change())
+        self.cbo_wday.set(wday_label)
+        self.cbo_wday.grid(row=row, column=0, sticky="w", **pad)
+
+        hh_vals = [f"{i:02d}" for i in range(24)]
+        self.cbo_hh = ctk.CTkOptionMenu(container, values=hh_vals, command=lambda *_: self._on_schedule_change())
+        self.cbo_hh.set(f"{int(entry.get('hour', 3)):02d}")
+        self.cbo_hh.grid(row=row, column=1, sticky="w", **pad)
+
+        # 0~55까지 5분 간격
+        mm_vals = [f"{i:02d}" for i in range(0, 60, 5)]
+        self.cbo_mm = ctk.CTkOptionMenu(container, values=mm_vals, command=lambda *_: self._on_schedule_change())
+        _mm0 = int(entry.get('min', 0))
+        _mm0 = max(0, min(55, _mm0 - (_mm0 % 5)))  # 5분 배수 스냅
+        self.cbo_mm.set(f"{_mm0:02d}")
+        self.cbo_mm.grid(row=row, column=2, sticky="w", **pad)
+        row += 1
+
+        self.lbl_auto_off = ctk.CTkLabel(container, text="예약 종료 후 자동 전원 끄기")
+        self.lbl_auto_off.grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        self.var_auto_off = ctk.BooleanVar(value=auto_off)
+        self.chk_auto_off = ctk.CTkCheckBox(container, text="PC 자동 종료",
+                                            variable=self.var_auto_off, command=self._on_schedule_change)
+        self.chk_auto_off.grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        self.lbl_delay = ctk.CTkLabel(container, text="지연 종료 대기(분)")
+        self.lbl_delay.grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
+        self.ent_delay = ctk.CTkEntry(container, width=120)
+        self.ent_delay.insert(0, str(delay_min))
+        self.ent_delay.bind("<KeyRelease>", self._on_schedule_change)
+        self.ent_delay.grid(row=row - 1, column=1, sticky="w", **pad)
+
+        # [ADD] 라벨 기본 색상 스냅샷(활성화 시 복원용)
+        self._sched_label_baseline = {
+            "lbl_wday_time": getattr(self, "lbl_wday_time").cget("text_color"),
+            "lbl_auto_off": self.lbl_auto_off.cget("text_color"),
+            "lbl_delay": getattr(self, "lbl_delay").cget("text_color"),
+        }
+
+        # 하단 바
+        bar = ctk.CTkFrame(parent)
+        bar.grid(row=2, column=0, sticky="ew", padx=0, pady=(4, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        self.lbl_sched_status = ctk.CTkLabel(bar, text="", text_color=("gray70", "gray40"))
+        self.lbl_sched_status.grid(row=0, column=0, sticky="w", padx=(8, 0))
+        self.btn_sched_save = ctk.CTkButton(bar, text="저장", width=120, command=self._on_save_schedule, state="disabled")
+        self.btn_sched_close = ctk.CTkButton(bar, text="닫기", width=120, command=self._maybe_close)
+        self.btn_sched_save.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.btn_sched_close.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        # 초기 렌더 상태를 즉시 반영(꺼져 있으면 하위 전부 disable)
+        self._apply_schedule_enabled_state()
+
+    def _snapshot_perf_ui(self) -> dict:
+        def _i(x, lo, hi, default):
+            try:
+                v = int(str(x).strip())
+                return max(lo, min(v, hi))
+            except Exception:
+                return default
+
+        return {
+            "low_spec": bool(self.var_low_spec.get()),
+            "tick_ms": _i(self.ent_tick_ms.get(), 200, 1000, int(self.settings.get("gui.tick_ms", 250))),
+            "lines": _i(self.ent_log_lines.get(), 200, 10000, int(self.settings.get("gui.log_max_lines", 800))),
+        }
+
+    def _on_perf_change(self, *_):
+        snap = self._snapshot_perf_ui()
+        is_dirty = (snap != getattr(self, "_perf_baseline", {}))
+        # 전역 dirty 플래그도 함께 갱신(닫기 경고 일관성 확보)
+        self._mark_dirty(is_dirty)
+        try:
+            self.btn_perf_save.configure(state=("normal" if is_dirty else "disabled"))
+            self.lbl_perf_status.configure(text=("변경 사항 있음" if is_dirty else ""))
+        except Exception:
+            pass
+
+    def _collect_perf_changes(self) -> dict:
+        """성능(저사양) 페이지 위젯에서 변경사항을 사전으로 수집."""
+        changes = {}
+        # 페이지가 아직 안 만들어졌으면 스킵
+        if not hasattr(self, "var_low_spec"):
+            return changes
+
+        # 스냅샷 재사용 (유효성 포함)
+        snap = self._snapshot_perf_ui()  # 이미 있는 함수
+        if bool(self.settings.get("gui.low_spec", False)) != snap["low_spec"]:
+            changes["gui.low_spec"] = snap["low_spec"]
+        if int(self.settings.get("gui.tick_ms", 250)) != snap["tick_ms"]:
+            changes["gui.tick_ms"] = snap["tick_ms"]
+        if int(self.settings.get("gui.log_max_lines", 800)) != snap["lines"]:
+            changes["gui.log_max_lines"] = snap["lines"]
+        return changes
+
+    def _save_perf_if_dirty(self) -> bool:
+        """
+        성능(저사양) 페이지에 변경이 있으면 settings에 반영하고 저장까지 수행.
+        저장 성공시 True 반환.
+        """
+        changes = self._collect_perf_changes()
+        if not changes:
+            return False
+
+        try:
+            for k, v in changes.items():
+                self.settings.set(k, v)
+            self.settings.save_strict()
+
+            # read-back 검증
+            ok = all(self.settings.get(k) == v for k, v in changes.items())
+            if not ok:
+                messagebox.showwarning("저장 경고", "일부 성능 설정이 정상 반영되지 않았습니다.", parent=self)
+            # 베이스라인 갱신(닫기 직후 dirty 경고 재발 방지)
+            if hasattr(self, "_perf_baseline"):
+                self._perf_baseline = self._snapshot_perf_ui()
+            # 즉시 적용(메인 GUI에 반영)
+            try:
+                tgt = getattr(self, "owner", None) or getattr(self, "master", None)
+                if tgt and hasattr(tgt, "apply_runtime_perf_settings"):
+                    tgt.apply_runtime_perf_settings()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"{e}", parent=self)
+            return False
+
+    def _on_save_perf(self):
+        # 스냅샷으로부터 검증된 값 확보
+        snap = self._snapshot_perf_ui()
+        changed = {}
+        if bool(self.settings.get("gui.low_spec", False)) != snap["low_spec"]:
+            changed["gui.low_spec"] = snap["low_spec"]
+        if int(self.settings.get("gui.tick_ms", 250)) != snap["tick_ms"]:
+            changed["gui.tick_ms"] = snap["tick_ms"]
+        if int(self.settings.get("gui.log_max_lines", 800)) != snap["lines"]:
+            changed["gui.log_max_lines"] = snap["lines"]
+
+        if not changed:
+            try:
+                self.lbl_perf_status.configure(text="변경 사항 없음")
+                self.btn_perf_save.configure(state="disabled")
+            except Exception:
+                pass
+            self._mark_dirty(False)
+            return
+
+        # 저장
+        try:
+            for k, v in changed.items():
+                self.settings.set(k, v)
+            self.settings.save_strict()
+            # read-back 검증(필요 최소)
+            ok = all(self.settings.get(k) == v for k, v in changed.items())
+            if not ok:
+                messagebox.showwarning("저장 경고", "일부 설정이 정상 반영되지 않았습니다.", parent=self)
+            # 베이스라인 갱신
+            self._perf_baseline = self._snapshot_perf_ui()
+            self._mark_dirty(False)
+            self.btn_perf_save.configure(state="disabled")
+            self.lbl_perf_status.configure(text="저장 완료")
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"{e}", parent=self)
+
+        # 런타임 즉시 반영
+        try:
+            target = getattr(self, "owner", None) or getattr(self, "master", None)
+            if target and hasattr(target, "apply_runtime_perf_settings"):
+                target.apply_runtime_perf_settings()
+        except Exception:
+            pass
+
+    # --- [NEW] 스팸 모드 탭/위젯 구성 ---
+    def _build_spam_page(self, parent):
+        # 레이아웃: 상단 안내 / 본문 / 하단 바
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)  # 본문 확장
+
+        cur = self.settings.get("spam_mode", {}) or {}
+        enabled = bool(cur.get("enabled", False))
+        enter0 = (cur.get("enter_images") or [""])[0] if isinstance(cur.get("enter_images"), list) else ""
+        exit0 = (cur.get("exit_images") or [""])[0] if isinstance(cur.get("exit_images"), list) else ""
+        key0 = str(cur.get("press_key", "s")).strip().lower()
+        itv0 = int(cur.get("interval_ms", 60))
+
+        # [ADD] 다중 선택 상태(초기값: settings의 리스트)
+        self._spam_enter_selected = list(cur.get("enter_images") or [])
+        self._spam_exit_selected = list(cur.get("exit_images") or [])
+
+        # ─ 상단 안내
+        top = ctk.CTkFrame(parent)
+        top.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        ctk.CTkLabel(top, text="스팸 모드(진입 이미지 감지→키 연타 / 탈출 이미지 감지→복귀)").grid(row=0, column=0, sticky="w", padx=10,
+                                                                            pady=8)
+
+        # ─ 본문
+        body = ctk.CTkFrame(parent)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=0)  # 라벨
+        body.grid_columnconfigure(1, weight=1)  # 입력행 컨테이너(콤보+썸네일)
+        body.grid_columnconfigure(2, weight=0)  # 우측 버튼 열
+
+        self.var_spam_enabled = ctk.BooleanVar(value=enabled)
+        self.chk_spam_enabled = ctk.CTkCheckBox(body, text="스팸 모드 활성화",
+                                                variable=self.var_spam_enabled, command=self._on_spam_change)
+        self.chk_spam_enabled.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 6))
+
+        self.lbl_spam_enter = ctk.CTkLabel(body, text="진입 이미지")
+        self.lbl_spam_enter.grid(row=1, column=0, sticky="w", padx=10, pady=(4, 2))
+
+        # 컨테이너: 썸네일(좌) + 버튼(우)
+        row_enter = ctk.CTkFrame(body, fg_color="transparent")
+        row_enter.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 2))
+        row_enter.grid_columnconfigure(0, weight=0)  # 썸네일
+        row_enter.grid_columnconfigure(1, weight=0)  # 버튼
+
+        # 썸네일(라벨)
+        self.lbl_spam_enter_prev = ctk.CTkLabel(row_enter, text="미리보기 없음", takefocus=0)
+        self.lbl_spam_enter_prev.grid(row=0, column=0, sticky="w")
+
+        # 다중 선택 모달 버튼
+        self.btn_spam_enter_pick = ctk.CTkButton(row_enter, text="선택…", width=70,
+                                                 command=lambda: self._open_spam_picker("enter"))
+        self.btn_spam_enter_pick.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        # 콤보 제거
+        self.cbo_spam_enter = None
+
+        self.lbl_spam_exit = ctk.CTkLabel(body, text="탈출 이미지")
+        self.lbl_spam_exit.grid(row=2, column=0, sticky="w", padx=10, pady=(2, 2))
+
+        # 컨테이너: 썸네일(좌) + 버튼(우)
+        row_exit = ctk.CTkFrame(body, fg_color="transparent")
+        row_exit.grid(row=2, column=1, sticky="w", padx=6, pady=(2, 2))
+        row_exit.grid_columnconfigure(0, weight=0)  # 썸네일
+        row_exit.grid_columnconfigure(1, weight=0)  # 버튼
+
+        # 썸네일(라벨)
+        self.lbl_spam_exit_prev = ctk.CTkLabel(row_exit, text="미리보기 없음", takefocus=0)
+        self.lbl_spam_exit_prev.grid(row=0, column=0, sticky="w")
+
+        # 다중 선택 모달 버튼
+        self.btn_spam_exit_pick = ctk.CTkButton(row_exit, text="선택…", width=70,
+                                                command=lambda: self._open_spam_picker("exit"))
+        self.btn_spam_exit_pick.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        # 콤보 제거
+        self.cbo_spam_exit = None
+
+        # 버튼은 우측 별도 열(column=2)에 — 썸네일 '왼쪽'이 됨
+        self.btn_spam_refresh = ctk.CTkButton(body, text="이미지 새로고침", width=120,
+                                              command=self._reload_spam_image_choices)
+        self.btn_spam_refresh.grid(row=2, column=2, sticky="w", padx=6, pady=(2, 2))
+
+        self.lbl_spam_key   = ctk.CTkLabel(body, text="연타 키")
+        self.lbl_spam_key.grid(row=3, column=0, sticky="w", padx=10, pady=(10,2))
+        self.cbo_spam_key = ctk.CTkComboBox(body, values=ALLOWED_SPAM_KEYS, width=120,
+                                            command=lambda *_: self._on_spam_change())
+        self.cbo_spam_key.set(key0 if key0 in ALLOWED_SPAM_KEYS else "s")
+        self.cbo_spam_key.grid(row=3, column=1, sticky="w", padx=6, pady=(10, 2))
+
+        self.lbl_spam_itv   = ctk.CTkLabel(body, text="간격(ms)")
+        self.lbl_spam_itv.grid(row=4, column=0, sticky="w", padx=10, pady=(2,2))
+        self.ent_spam_itv = ctk.CTkEntry(body, width=120)
+        self.ent_spam_itv.insert(0, str(itv0))
+        self.ent_spam_itv.grid(row=4, column=1, sticky="w", padx=6, pady=(2, 2))
+        self.ent_spam_itv.bind("<KeyRelease>", self._on_spam_change)
+
+        # ─ 하단 바(다른 탭과 동일)
+        bar = ctk.CTkFrame(parent)
+        bar.grid(row=2, column=0, sticky="ew", padx=0, pady=(4, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        self.lbl_spam_status = ctk.CTkLabel(bar, text="", text_color=("gray70", "gray40"))
+        self.lbl_spam_status.grid(row=0, column=0, sticky="w", padx=(8, 0))
+        self.btn_spam_save = ctk.CTkButton(bar, text="저장", width=120, command=self._on_save_spam, state="disabled")
+        self.btn_spam_close = ctk.CTkButton(bar, text="닫기", width=120, command=self._maybe_close)
+        self.btn_spam_save.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.btn_spam_close.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        # baseline 이후 초기 상태/미리보기 반영
+        self._apply_spam_enabled_state()
+        self._update_spam_preview_all()
+
+        # 베이스라인 스냅샷 (dirty 비교 기준)
+        self._spam_baseline = self._snapshot_spam_ui()
+
+    def _ensure_spam_choices_loaded(self):
+        """self._spam_img_choices를 준비한다. 실패해도 [] 보장."""
+        if getattr(self, "_spam_img_choices", None) is not None:
+            return self._spam_img_choices
+
+        try:
+            from path_manager import BASE_DIR
+            p = (BASE_DIR / "routine.json")
+        except Exception:
+            from pathlib import Path
+            p = Path("routine.json")
+
+        imgs = []
+        try:
+            if p.exists():
+                import json
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    # 최상위 배열 [{image:...}, ...]
+                    for it in data:
+                        x = str((it or {}).get("image", "")).strip()
+                        if x: imgs.append(x)
+                elif isinstance(data, dict):
+                    # 객체형 {"routine_items":[...]}
+                    for it in (data.get("routine_items") or []):
+                        x = str((it or {}).get("image", "")).strip()
+                        if x: imgs.append(x)
+        except Exception:
+            imgs = []
+
+        self._spam_img_choices = sorted(set(imgs))
+        return self._spam_img_choices
+
+    def _reload_spam_image_choices(self):
+        # [ADD] 썸네일 캐시 비우기(경로/파일 교체 반영)
+        self._spam_thumb_cache = {}
+        self._spam_thumb_dim_cache = {}
+
+        self._spam_img_choices = self._scan_routine_images()
+
+        # 선택 모달은 self._spam_img_choices를 직접 사용하므로 별도 갱신 불필요
+        self._on_spam_change()
+        self._update_spam_preview_all()
+        # [ADD] 현재 토글 상태에 맞춰 최종 표시/숨김 확정
+        self._show_spam_previews(bool(self.var_spam_enabled.get()))
+
+    def _scan_routine_images(self) -> list[str]:
+        from pathlib import Path
+        import json
+        try:
+            from path_manager import BASE_DIR
+            rjson_path = (BASE_DIR / "routine.json")
+        except Exception:
+            rjson_path = Path("routine.json")
+
+        imgs: list[str] = []
+        try:
+            if rjson_path.exists():
+                data = json.loads(rjson_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for it in data:
+                        img = str((it or {}).get("image", "")).strip()
+                        if img: imgs.append(img)
+                elif isinstance(data, dict):
+                    for it in (data.get("routine_items") or []):
+                        img = str((it or {}).get("image", "")).strip()
+                        if img: imgs.append(img)
+        except Exception:
+            pass
+
+        names = sorted(set(imgs))
+        # [ADD] 경로 캐시 미리워밍(선택)
+        try:
+            for n in names:
+                _ = self._resolve_spam_image_path(n)
+        except Exception:
+            pass
+        return names
+
+    def _snapshot_spam_ui(self) -> dict:
+        def _i(s, lo, hi, default):
+            try:
+                v = int(str(s).strip())
+                return max(lo, min(hi, v))
+            except Exception:
+                return default
+
+        key = (self.cbo_spam_key.get().strip().lower() if hasattr(self, "cbo_spam_key") else "s")
+        if key not in ALLOWED_SPAM_KEYS: key = "s"
+        # 콤보는 “빠른 추가” 용으로만 유지하고, 실제 저장은 다중 선택 리스트를 사용
+        enter_list = list(dict.fromkeys(x for x in (self._spam_enter_selected or []) if x))  # 중복 제거/원순서 유지
+        exit_list = list(dict.fromkeys(x for x in (self._spam_exit_selected or []) if x))
+        itv = _i(self.ent_spam_itv.get(), 10, 500, 60) if hasattr(self, "ent_spam_itv") else 60
+        return {
+            "enabled": bool(self.var_spam_enabled.get()) if hasattr(self, "var_spam_enabled") else False,
+            "enter_images": enter_list,
+            "exit_images": exit_list,
+            "press_key": key,
+            "interval_ms": itv,
+        }
+
+    def _apply_spam_enabled_state(self):
+        """스팸 모드 on/off에 따라 입력/색/썸네일 디밍까지 일괄 적용."""
+        enabled = bool(self.var_spam_enabled.get())
+        state = "normal" if enabled else "disabled"
+
+        # 위젯 상태
+        widgets = [self.cbo_spam_key, self.ent_spam_itv, self.btn_spam_refresh,
+                   self.btn_spam_enter_pick, self.btn_spam_exit_pick]
+        for w in (self.cbo_spam_enter, self.cbo_spam_exit):
+            if w is not None:
+                widgets.append(w)
+        for w in widgets:
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+        # 라벨 색상(초기 색 저장)
+        if not hasattr(self, "_spam_label_baseline"):
+            self._spam_label_baseline = {
+                "enter": self.lbl_spam_enter.cget("text_color"),
+                "exit": self.lbl_spam_exit.cget("text_color"),
+                "key": self.lbl_spam_key.cget("text_color"),
+                "itv": self.lbl_spam_itv.cget("text_color"),
+            }
+        dim = ("gray70", "gray40")
+        try:
+            self.lbl_spam_enter.configure(text_color=(self._spam_label_baseline["enter"] if enabled else dim))
+        except Exception:
+            pass
+        try:
+            self.lbl_spam_exit.configure(text_color=(self._spam_label_baseline["exit"] if enabled else dim))
+        except Exception:
+            pass
+        try:
+            self.lbl_spam_key.configure(text_color=(self._spam_label_baseline["key"] if enabled else dim))
+        except Exception:
+            pass
+        try:
+            self.lbl_spam_itv.configure(text_color=(self._spam_label_baseline["itv"] if enabled else dim))
+        except Exception:
+            pass
+
+        # 미리보기 처리
+        if enabled:
+            # 1) 그림 먼저 갱신
+            self._update_spam_preview_all()
+            # 2) 선택 유무 기준으로 보이기/숨기기 결정
+            self._sync_preview_visibility()
+        else:
+            # 비활성이면 전부 숨김
+            self._show_spam_previews(False)
+
+    def _on_spam_change(self, *_):
+        try:
+            # 1) 상태/색/썸네일 즉시 반영
+            self._apply_spam_enabled_state()
+            # 1.5) 가시화 최종 보정(선택이 0개면 숨김)
+            self._sync_preview_visibility()
+
+            # 2) dirty 판정 + 상태 텍스트
+            snap = self._snapshot_spam_ui()
+            is_dirty = (snap != getattr(self, "_spam_baseline", {}))
+            if hasattr(self, "_mark_dirty"):
+                self._mark_dirty(is_dirty)
+            self.btn_spam_save.configure(state=("normal" if is_dirty else "disabled"))
+            self.lbl_spam_status.configure(text=("변경 사항 있음" if is_dirty else ""))
+        except Exception:
+            pass
+
+    def _collect_spam_changes(self) -> dict:
+        """현재 UI와 settings의 spam_mode를 비교해 바뀐 항목만 반환."""
+        snap = self._snapshot_spam_ui()
+        cur = self.settings.get("spam_mode", {}) or {}
+        normalized_cur = {
+            "enabled": bool(cur.get("enabled", False)),
+            "enter_images": list(cur.get("enter_images") or []),
+            "exit_images": list(cur.get("exit_images") or []),
+            "press_key": str(cur.get("press_key", "s")).strip().lower(),
+            "interval_ms": int(cur.get("interval_ms", 60)),
+        }
+        return {"spam_mode": snap} if (snap != normalized_cur) else {}
+
+    def _save_spam_if_dirty(self) -> bool:
+        changed = self._collect_spam_changes()
+        if not changed:
+            try:
+                self.lbl_spam_status.configure(text="변경 사항 없음")
+                self.btn_spam_save.configure(state="disabled")
+            except Exception:
+                pass
+            # [ADD] 전역 dirty 강제 해제 (저장 버튼이 비활성이어도 _dirty가 True일 수 있음)
+            try:
+                self._mark_dirty(False)
+            except Exception:
+                pass
+            return False
+
+        try:
+            for k, v in changed.items():
+                self.settings.set(k, v)
+            # 디스크 저장
+            try:
+                self.settings.flush_debounced(immediate=True)
+            except Exception:
+                self.settings.save()
+
+            # 런타임 반영
+            try:
+                import main as _main
+                if hasattr(_main, "reload_spam_mode_from_settings"):
+                    _main.reload_spam_mode_from_settings()
+            except Exception:
+                pass
+
+            # 베이스라인 갱신 + 버튼 상태
+            self._spam_baseline = self._snapshot_spam_ui()
+            self.btn_spam_save.configure(state="disabled")
+            self.lbl_spam_status.configure(text="저장 완료")
+            # [ADD] 전역 dirty 해제 → 닫기 시 추가 확인 창 방지
+            try:
+                self._mark_dirty(False)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"{e}", parent=self)
+            return False
+
+    def _on_save_spam(self):
+        self._save_spam_if_dirty()
+
+    # [ADD] --- spam image helpers ---
+    def _resolve_existing_path(self, p: Path) -> Path | None:
+        try:
+            return p if p.exists() else None
+        except Exception:
+            return None
+
+    def _resolve_spam_image_path(self, name: str) -> Path | None:
+        """
+        썸네일 원본 파일의 실제 경로를 해석한다.
+        탐색 우선순위:
+          1) 절대경로 그대로
+          2) BASE_DIR / get_img_path() / name     (예: resources/1920x1080/s2.png)
+          3) BASE_DIR / "resources" / name
+          4) BASE_DIR / name
+          5) BASE_DIR 내 case-insensitive rglob(name)
+        """
+        if not name:
+            return None
+
+        from pathlib import Path
+
+        def _exists(p: Path) -> Path | None:
+            try:
+                return p if p.exists() else None
+            except Exception:
+                return None
+
+        # 1) 절대경로
+        try:
+            p = Path(name)
+            if p.is_absolute():
+                hit = _exists(p)
+                if hit:
+                    return hit
+        except Exception:
+            pass
+
+        # 2) 해상도 폴더(최우선)
+        try:
+            # get_img_path()는 "resources/{WxH}/" 같은 상대경로 문자열을 반환
+            res_dir = BASE_DIR / Path(get_img_path())
+            hit = _exists(res_dir / name)
+            if hit:
+                return hit
+        except Exception:
+            pass
+
+        # 3) resources 바로 아래
+        hit = _exists(BASE_DIR / "resources" / name)
+        if hit:
+            return hit
+
+        # 4) 프로젝트 루트 바로 아래
+        hit = _exists(BASE_DIR / name)
+        if hit:
+            return hit
+
+        # 5) 마지막 수단: 대소문자 무시 전체 검색
+        try:
+            target_lower = name.lower()
+            for p in BASE_DIR.rglob("*"):
+                # 너무 큰 트리에서 비용 줄이기: 파일만 검사
+                if not p.is_file():
+                    continue
+                if p.name.lower() == target_lower:
+                    return p
+        except Exception:
+            pass
+
+        return None
+
+    def _get_pil_thumb(self, name: str, side: int = 48, dim: bool = False):
+        """
+        PIL 이미지 썸네일 반환(투명 유지). 기존 _get_ctk_thumb와 동일 경로해석/캐시 사용.
+        """
+        try:
+            p = self._resolve_spam_image_path(name)
+            if not p: return None
+            from PIL import Image, ImageEnhance
+            im = Image.open(p).convert("RGBA")
+            im.thumbnail((side, side), Image.Resampling.LANCZOS)
+            if dim:
+                # 살짝 디밍
+                r, g, b, a = im.split()
+                base = Image.new("RGBA", im.size, (0, 0, 0, 0))
+                base.paste(im, mask=a)
+                im = Image.blend(base, Image.new("RGBA", im.size, (60, 60, 60, 0)), 0.25)
+            return im
+        except Exception:
+            return None
+
+    def _get_ctk_thumb(self, name: str, dim: bool = False):
+        """원본보다 키우지 않는다(Downscale-only). 비율 유지. 높이/너비 상한을 동시에 만족."""
+        if not hasattr(self, "_spam_thumb_cache"):
+            self._spam_thumb_cache = {}
+            self._spam_thumb_dim_cache = {}
+
+        cache = self._spam_thumb_dim_cache if dim else self._spam_thumb_cache
+        if name in cache:
+            return cache[name]
+
+        p = self._resolve_spam_image_path(name)
+        if not p:
+            cache[name] = None
+            return None
+
+        try:
+            im = Image.open(p).convert("RGBA")
+            w0, h0 = im.width, im.height
+            if w0 <= 0 or h0 <= 0:
+                cache[name] = None
+                return None
+
+            # 축소 비율(업스케일 금지: 1.0보다 커지지 않음)
+            r_h = SPAM_THUMB_H / h0
+            r_w = SPAM_THUMB_MAX_W / w0
+            r = min(r_h, r_w, 1.0)  # <- 핵심
+
+            w = max(1, int(round(w0 * r)))
+            h = max(1, int(round(h0 * r)))
+
+            if r < 1.0:
+                im = im.resize((w, h), Image.LANCZOS)  # 축소만 수행
+
+            if dim:
+                im = ImageEnhance.Brightness(im).enhance(SPAM_THUMB_DIM)
+
+            cimg = ctk.CTkImage(light_image=im, dark_image=im, size=(w, h))
+            cache[name] = cimg
+            return cimg
+        except Exception:
+            cache[name] = None
+            return None
+
+    def _update_spam_preview(self, which: str):
+        try:
+            lbl = self.lbl_spam_enter_prev if which == "enter" else self.lbl_spam_exit_prev
+            enabled = bool(self.var_spam_enabled.get())
+            names = (self._spam_enter_selected if which == "enter" else self._spam_exit_selected) or []
+
+            # 라벨이 숨겨졌다면 먼저 보이게
+            try:
+                lbl.grid()
+            except Exception:
+                pass
+
+            if not names:
+                self._clear_preview_image(lbl)
+                # 비어 있을 때는 라벨 자체를 숨김 (완전 제거)
+                try:
+                    lbl.grid_remove()
+                except Exception:
+                    pass
+                return
+            else:
+                # 다시 선택되었으면 썸네일 영역 복원
+                try:
+                    if not lbl.winfo_ismapped():
+                        lbl.grid()
+                except Exception:
+                    pass
+
+            # --- 항상 이전 이미지 완전 제거 후 시작 ---
+            self._clear_preview_image(lbl)
+
+            # 모자이크 합성
+            tile, pad, max_cols = 48, 2, 6
+            cols = min(max_cols, max(1, len(names)))
+            rows = (len(names) + cols - 1) // cols
+            from PIL import Image
+            W = cols * tile + (cols - 1) * pad
+            H = rows * tile + (rows - 1) * pad
+            canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+            for idx, nm in enumerate(names):
+                col, row = (idx % cols), (idx // cols)
+                x, y = col * (tile + pad), row * (tile + pad)
+                thumb = self._get_pil_thumb(nm, side=tile, dim=(not enabled))
+                if thumb is not None:
+                    canvas.paste(thumb, (x, y), mask=thumb if thumb.mode == "RGBA" else None)
+
+            # 새 이미지 구성 + 다중 레퍼런스 보관
+            cimg = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(W, H))
+            lbl.configure(image=cimg, text="")
+            lbl._image = cimg  # CTk 내부용(관례)
+            lbl.image = cimg  # Tkinter 관례까지 함께 유지
+
+            # 클래스 레벨 캐시에도 저장(가비지콜렉션 방지 > 드문 케이스 커버)
+            if not hasattr(self, "_spam_prev_cache"):
+                self._spam_prev_cache = {}
+            self._spam_prev_cache[which] = cimg
+
+            # 즉시 리페인트
+            try:
+                lbl.update_idletasks()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _update_spam_preview_all(self):
+        self._update_spam_preview("enter")
+        self._update_spam_preview("exit")
+
+    # [ADD] 프리뷰 라벨 강제 해제/숨김/표시
+    def _clear_preview_image(self, lbl):
+        try:
+            lbl.configure(image=None, text="")  # 텍스트/이미지 초기화
+            for attr in ("_image", "image"):
+                if hasattr(lbl, attr):
+                    setattr(lbl, attr, None)
+        except Exception:
+            pass
+
+    def _show_spam_previews(self, show: bool):
+        targets = [self.lbl_spam_enter_prev, self.lbl_spam_exit_prev]
+        for lbl in targets:
+            try:
+                if show:
+                    # 숨겨져 있었으면 다시 표시
+                    if not lbl.winfo_ismapped():
+                        lbl.grid()
+                else:
+                    # 완전 제거 (텍스트/이미지 초기화 + 숨김)
+                    self._clear_preview_image(lbl)
+                    lbl.grid_remove()
+            except Exception:
+                pass
+
+    def _sync_preview_visibility(self):
+        """선택 유무와 스팸 활성 상태에 맞춰 라벨을 보이거나 숨긴다."""
+        enabled = bool(self.var_spam_enabled.get())
+        pairs = (("enter", self.lbl_spam_enter_prev), ("exit", self.lbl_spam_exit_prev))
+        for which, lbl in pairs:
+            has = bool(self._spam_enter_selected) if which == "enter" else bool(self._spam_exit_selected)
+            try:
+                if enabled and has:
+                    if not lbl.winfo_ismapped():
+                        lbl.grid()
+                else:
+                    self._clear_preview_image(lbl)
+                    if lbl.winfo_ismapped():
+                        lbl.grid_remove()
+            except Exception:
+                pass
+
+    def _open_spam_picker(self, which: str):
+        """
+        which in {'enter','exit'}
+        체크박스 리스트 + 썸네일(옵션) 모달을 띄워 다중 선택.
+        """
+        import tkinter as tk
+        # 부모 topmost 해제 push
+        self._push_topmost()
+
+        # (1) 시작부: topmost 스택/토글 불필요. 아래 3줄만 보장
+        win = ctk.CTkToplevel(self)
+        win.title("스팸 이미지 선택")
+        win.transient(self)
+        win.grab_set()
+        try:
+            win.attributes("-topmost", True)
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+
+        # 검색
+        search_var = tk.StringVar()
+        frm_top = ctk.CTkFrame(win)
+        frm_top.pack(fill="x", padx=8, pady=(8, 4))
+        ent_search = ctk.CTkEntry(frm_top, placeholder_text="이름 검색", textvariable=search_var)
+        ent_search.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        btn_clear = ctk.CTkButton(frm_top, text="지우기", width=70, command=lambda: search_var.set(""))
+        btn_clear.pack(side="left")
+
+        # 스크롤 영역
+        frm_list = ctk.CTkScrollableFrame(win, width=480, height=420)
+        frm_list.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # 현재 선택 상태
+        selected = set(self._spam_enter_selected if which == "enter" else self._spam_exit_selected)
+
+        # 체크박스 렌더
+        rows = []
+
+        def rebuild():
+            for r in rows:
+                try:
+                    r.destroy()
+                except Exception:
+                    pass
+            rows.clear()
+            kw = (search_var.get() or "").strip().lower()
+            for name in self._spam_img_choices:
+                if kw and (kw not in name.lower()):
+                    continue
+                row = ctk.CTkFrame(frm_list, fg_color="transparent")
+                row.pack(fill="x", padx=2, pady=2)
+                var = tk.BooleanVar(value=(name in selected))
+                chk = ctk.CTkCheckBox(row, text=name, variable=var)
+                chk.pack(side="left", padx=(4, 6))
+                # (옵션) 작은 미리보기
+                try:
+                    img = self._get_ctk_thumb(name, dim=False)
+                    if img:
+                        prev = ctk.CTkLabel(row, image=img, text="")
+                        prev._image = img
+                        prev.pack(side="left")
+                except Exception:
+                    pass
+
+                # 선택 토글 동기화
+                def _on_toggle(n=name, v=var):
+                    if v.get():
+                        selected.add(n)
+                    else:
+                        selected.discard(n)
+
+                chk.configure(command=_on_toggle)
+                rows.append(row)
+
+        rebuild()
+        ent_search.bind("<KeyRelease>", lambda *_: rebuild())
+
+        # 하단 버튼
+        frm_bot = ctk.CTkFrame(win)
+        frm_bot.pack(fill="x", padx=8, pady=(4, 8))
+
+        selected = set(self._spam_enter_selected if which == "enter" else self._spam_exit_selected)
+
+        def on_ok():
+            lst = sorted(selected)
+            if which == "enter":
+                self._spam_enter_selected = lst
+            else:
+                self._spam_exit_selected = lst
+            # 프리뷰를 모달 닫기 전에 즉시 갱신(시각적으로 확실)
+            self._update_spam_preview(which)
+            win.destroy()
+
+        ctk.CTkButton(frm_bot, text="확인", width=100, command=on_ok).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(frm_bot, text="취소", width=100, command=win.destroy).pack(side="right")
+
+        # X/ESC도 동일 동작
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.bind("<Escape>", lambda *_: win.destroy(), add="+")
+
+        # (2) 닫힘 대기
+        win.wait_window()
+
+        # (3) 단 한 번의 복귀 루틴만 호출
+        self._restore_after_child_close()
+
+        # (4) 프리뷰/상태 동기화
+        self._on_spam_change()
+
+    # ---------- 스팸 모드 관련 끝 ----------
+
+    def _snapshot_schedule_ui(self) -> dict:
+        def _i(txt, lo, hi, default):
+            try:
+                v = int(str(txt).strip())
+                return max(lo, min(v, hi))
+            except Exception:
+                return default
+
+        weekday_key = self._wday_to_key.get(self.cbo_wday.get(), "mon")
+        hh = _i(self.cbo_hh.get(), 0, 23, 3)
+        mm = _i(self.cbo_mm.get(), 0, 59, 0)
+        delay = _i(self.ent_delay.get(), 0, 600, 20)  # 최대 10시간 가드
+        snap = {
+            "schedule.enabled": bool(self.var_sched_enabled.get()),
+            "schedule.entries": [{"weekday": weekday_key, "time": f"{hh:02d}:{mm:02d}"}],
+            "schedule.shutdown_delay_min": delay,
+            "schedule.auto_poweroff": bool(self.var_auto_off.get()),
+        }
+        return snap
+
+    def _on_schedule_change(self, *_):
+        try:
+            snap = self._snapshot_schedule_ui()
+            # 현재 settings와 비교
+            cur = self.settings.get("schedule", {}) or {}
+            cur_ent = (cur.get("entries") or [{"weekday": "mon", "time": "03:00"}])[0]
+            cur_key = {
+                "schedule.enabled": bool(cur.get("enabled", False)),
+                "schedule.entries": [
+                    {"weekday": str(cur_ent.get("weekday", "mon")), "time": str(cur_ent.get("time", "03:00"))}],
+                "schedule.shutdown_delay_min": int(cur.get("shutdown_delay_min", 20)),
+                "schedule.auto_poweroff": bool(cur.get("auto_poweroff", True)),
+            }
+
+            is_dirty = (snap != cur_key)
+            self._mark_dirty(is_dirty)
+            self.btn_sched_save.configure(state=("normal" if is_dirty else "disabled"))
+            self.lbl_sched_status.configure(text=("변경 사항 있음" if is_dirty else ""))
+        except Exception:
+            # UI 에러는 치명적이지 않음
+            pass
+
+    def _collect_schedule_changes(self) -> dict:
+        changes = {}
+        snap = self._snapshot_schedule_ui()
+        cur = self.settings.get("schedule", {}) or {}
+        # enabled
+        if bool(cur.get("enabled", False)) != snap["schedule.enabled"]:
+            changes["schedule.enabled"] = snap["schedule.enabled"]
+        # entries (단일 엔트리 비교)
+        cur_ent = (cur.get("entries") or [{"weekday": "mon", "time": "03:00"}])[0]
+        new_ent = snap["schedule.entries"][0]
+        if (str(cur_ent.get("weekday", "mon")) != new_ent["weekday"] or
+                str(cur_ent.get("time", "03:00")) != new_ent["time"]):
+            changes["schedule.entries"] = [new_ent]
+        # delay
+        if int(cur.get("shutdown_delay_min", 20)) != int(snap["schedule.shutdown_delay_min"]):
+            changes["schedule.shutdown_delay_min"] = int(snap["schedule.shutdown_delay_min"])
+        # auto_off
+        if bool(cur.get("auto_poweroff", True)) != bool(snap["schedule.auto_poweroff"]):
+            changes["schedule.auto_poweroff"] = bool(snap["schedule.auto_poweroff"])
+        return changes
+
+    def _on_save_schedule(self):
+        self._save_schedule_if_dirty()
+
+    def _save_schedule_if_dirty(self) -> bool:
+        changed = self._collect_schedule_changes()
+        if not changed:
+            try:
+                self.lbl_sched_status.configure(text="변경 사항 없음")
+                self.btn_sched_save.configure(state="disabled")
+            except Exception:
+                pass
+            return False
+
+        # settings 반영
+        for k, v in changed.items():
+            self.settings.set(k, v)
+        # 디스크 즉시 저장
+        try:
+            self.settings.flush_debounced(immediate=True)
+        except Exception:
+            self.settings.save()
+
+        # 런타임 재적용 + 상태 로그
+        try:
+            import main as _mainmod
+            # 1) 런타임 재적용
+            _mainmod.reload_scheduled_shutdown()  # ← 인자 없음
+
+            # 2) 상태 로그 출력(첫 엔트리만 표기)
+            s = self.settings.get("schedule", {}) or {}
+            ent = (s.get("entries") or [])
+            weekday_ko = ""
+            hhmm = ""
+            if ent:
+                wd_key = str(ent[0].get("weekday", "mon"))
+                hhmm = str(ent[0].get("time", "03:00"))
+                _KO = {"mon": "월", "tue": "화", "wed": "수", "thu": "목", "fri": "금", "sat": "토", "sun": "일"}
+                weekday_ko = _KO.get(wd_key, wd_key)
+
+            try:
+                _mainmod.log_scheduled_shutdown_state(
+                    enabled=bool(s.get("enabled", False)),
+                    weekday_ko=weekday_ko,
+                    hhmm=hhmm,
+                    auto_poweroff=bool(s.get("auto_poweroff", False)),
+                    delay_min=int(s.get("shutdown_delay_min", 20)),
+                )
+            except Exception:
+                pass
+
+            # 3) 예약 기능을 끄면 보류된 OS 종료 타이머를 명시적으로 해제
+            try:
+                if "schedule.enabled" in changed and changed["schedule.enabled"] is False:
+                    # NOTE: main에 래퍼가 없으므로 컨트롤러 직접 접근
+                    getattr(_mainmod, "_SCHED_SD", None) and _mainmod._SCHED_SD.cancel_pending_shutdown()
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        try:
+            self.lbl_sched_status.configure(text="저장 완료")
+            self.btn_sched_save.configure(state="disabled")
+        except Exception:
+            pass
+        # 전체 닫기 경고 일관성
+        self._mark_dirty(False)
+        return True
+
+    def _apply_schedule_enabled_state(self):
+        """예약 종료 활성/비활성에 따라 하위 위젯 일괄 제어 + 시각적 디밍."""
+        enabled = bool(self.var_sched_enabled.get())
+        state = "normal" if enabled else "disabled"
+        # 입력 위젯 상태 변경
+        for w in (self.cbo_wday, self.cbo_hh, self.cbo_mm, self.chk_auto_off, self.ent_delay):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+        # 라벨 디밍(켜질 때는 원복)
+        dim = ("gray70", "gray40")
+        if not hasattr(self, "_sched_label_baseline"):
+            # 방어적 초기화: 혹시 빌드 순서 이슈가 있어도 NPE 방지
+            self._sched_label_baseline = {
+                "lbl_wday_time": self.lbl_wday_time.cget("text_color"),
+                "lbl_auto_off": self.lbl_auto_off.cget("text_color"),
+                "lbl_delay": self.lbl_delay.cget("text_color"),
+            }
+
+        if enabled:
+            # 원래 색으로 복원(기본값이면 None일 수 있음)
+            try:
+                self.lbl_wday_time.configure(text_color=self._sched_label_baseline.get("lbl_wday_time"))
+            except Exception:
+                pass
+            try:
+                self.lbl_auto_off.configure(text_color=self._sched_label_baseline.get("lbl_auto_off"))
+            except Exception:
+                pass
+            try:
+                self.lbl_delay.configure(text_color=self._sched_label_baseline.get("lbl_delay"))
+            except Exception:
+                pass
+        else:
+            # 명시적 디밍
+            try:
+                self.lbl_wday_time.configure(text_color=dim)
+            except Exception:
+                pass
+            try:
+                self.lbl_auto_off.configure(text_color=dim)
+            except Exception:
+                pass
+            try:
+                self.lbl_delay.configure(text_color=dim)
+            except Exception:
+                pass
+
     def _snapshot_email_ui(self) -> dict:
         """현재 UI 상태를 dict로 스냅샷."""
         snap = {
@@ -870,7 +2211,27 @@ class SettingsDialog(ctk.CTkToplevel):
             return  # 취소
 
         if res is True:
-            self._on_save_email()  # 검증/저장
+            # 1) 성능(저사양) 탭 변경사항 먼저 반영+저장 (+ 런타임 즉시 적용까지 내부에서 수행)
+            try:
+                self._save_perf_if_dirty()
+            except Exception:
+                pass
+
+            # [ADD] 1.5) 예약 종료 저장(변경 없으면 영향 없음)
+            try:
+                self._save_schedule_if_dirty()
+            except Exception:
+                pass
+
+            # [ADD] 1.7) 스팸 모드 저장(변경 없으면 영향 없음)
+            try:
+                self._save_spam_if_dirty()
+            except Exception:
+                pass
+
+            # 2) 이메일 탭 저장(변경 없으면 영향 없음)
+            self._on_save_email()
+
             try:
                 if hasattr(self, "_parent_app") and hasattr(self._parent_app, "set_alpha_tracking_enabled"):
                     self._parent_app.set_alpha_tracking_enabled(True)
@@ -1006,26 +2367,67 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception: pass
 
     def _on_save_email(self):
+        if getattr(self, "_save_in_progress", False):
+            return
         cfg = self._collect_email_cfg()
-        self._save_partial_email(cfg)
-        self._apply_live(cfg)
+        # 검증 실패 시 return 하므로 여기서 버튼 잠그기
+        self._save_in_progress = True
+        try:
+            self.btn_save.configure(state="disabled", text="저장 중…")
+            try:
+                self.progress.grid()  # 인디케이터 보이기
+                self.progress.start()
+                self.lbl_status.configure(text="디스크에 저장하는 중…")
+            except Exception:
+                pass
 
-        # UI 재적용(저장된 값이 바로 보이게)
-        sid, sdomain = self._split_sender(cfg.get("sender", ""))
-        self.ent_sender_id.delete(0, "end")
-        self.ent_sender_id.insert(0, sid or "")
-        self.cbo_domain.set(sdomain if sdomain in (GMAIL,NAVER) else GMAIL)
-        self._update_sender_preview()
+            def _work():
+                try:
+                    self.settings.set("email", cfg)
+                    try:
+                        self.settings.flush_debounced(immediate=True)
+                    except Exception:
+                        self.settings.save()
+                    # 라이브 반영 (autoemail/emailq)
+                    try:
+                        import autoemail
+                        autoemail.configure(cfg)
+                        if self.emailq is not None:
+                            self.emailq.configure(cfg)
+                    except Exception:
+                        pass
 
-        self.ent_recipients.delete(0, "end")
-        self.ent_recipients.insert(0, cfg.get("recipients", ""))
+                    # UI 스레드: 베이스라인 갱신 + 상태 리셋
+                    def _ui_done():
+                        try:
+                            self._baseline = self._snapshot_email_ui()
+                            self._mark_dirty(False)  # 저장 버튼 비활성화 유지
+                            self.lbl_status.configure(text="저장됨 ✓")
+                        except Exception:
+                            pass
 
-        messagebox.showinfo("완료", "이메일 설정을 저장했습니다.", parent=self)
-        # 저장 완료 → 현재 상태를 baseline으로, 저장 버튼 비활성화
-        self._baseline = self._snapshot_email_ui()
-        self._mark_dirty(False)
-        try: self.focus_force()
-        except Exception: pass
+                    self.after(0, _ui_done)
+                finally:
+                    def _ui_cleanup():
+                        try:
+                            self.progress.stop()
+                            self.progress.grid_remove()
+                            self.btn_save.configure(text="저장")
+                        except Exception:
+                            pass
+                        setattr(self, "_save_in_progress", False)
+
+                    self.after(0, _ui_cleanup)
+
+            import threading
+            threading.Thread(target=_work, daemon=True).start()
+        except Exception:
+            # 예외 시 복구
+            try:
+                self.btn_save.configure(text="저장", state="normal")
+            except Exception:
+                pass
+            self._save_in_progress = False
 
     # 테스트 메일: 알림 사용 여부와 무관. 진행 상태/스피너 표시.
     def _on_test_email(self):
@@ -1270,3 +2672,35 @@ class SettingsDialog(ctk.CTkToplevel):
 
     # ------- page switch -------
     def _show_email_tab(self):  self.page_email.lift()
+
+    def _show_perf_tab(self):
+        self.page_perf.lift()
+
+    def _show_schedule_tab(self):
+        self.page_schedule.lift()
+
+    def _show_spam_tab(self):
+        try:
+            self._lift_page(self.page_spam)
+        except Exception:
+            # _lift_page가 없다면 최소 동작 보장
+            try:
+                self.page_spam.lift()
+            except Exception:
+                pass
+
+    def _lift_page(self, target):
+        # content 아래에 얹힌 모든 page_*를 한 번에 관리
+        pages = []
+        for name in ("page_email", "page_perf", "page_schedule", "page_spam"):
+            pg = getattr(self, name, None)
+            if pg is not None:
+                pages.append(pg)
+        # 타겟 올리고 나머지 내림
+        try:
+            target.lift()
+            for p in pages:
+                if p is not target:
+                    p.lower()
+        except Exception:
+            pass

@@ -17,6 +17,56 @@ _TESS_CFG_CACHE = None
 # 모듈 캐시(한 번만 계산)
 _RESOLVED_TESSDATA_DIR = None
 
+# 언어 가용성 캐시 (tessdata_dir → frozenset)
+_AVAIL_LANGS_CACHE: dict = {}
+
+# === (초저사양 최적화) Tesseract 쓰레드/우선순위 주입 ===
+# 1) OpenMP 스레드 상한: Tesseract 내부 병렬화를 1코어로 제한
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+def _install_lowprio_for_tesseract() -> None:
+    """
+    pytesseract가 띄우는 tesseract.exe를 'Below Normal' 우선순위로 실행.
+    Windows에서만 적용, 1회 주입.
+    """
+    try:
+        if not sys.platform.startswith("win"):
+            return
+        # pytesseract 내부 subprocess.Popen 래핑
+        _orig_popen = pytesseract.pytesseract.subprocess.Popen  # type: ignore[attr-defined]
+        BELOW_NORMAL = 0x00004000  # Windows Priority Class
+
+        def _lowprio_popen(*args, **kwargs):
+            # tesseract 호출만 대상으로 한정
+            try:
+                cmd0 = None
+                if args and isinstance(args[0], (list, tuple)):
+                    cmd0 = args[0][0]
+                elif "args" in kwargs:
+                    a = kwargs["args"]
+                    cmd0 = a[0] if isinstance(a, (list, tuple)) else None
+                is_tess = (cmd0 and "tesseract" in str(cmd0).lower())
+            except Exception:
+                is_tess = False
+
+            if is_tess:
+                flags = kwargs.get("creationflags", 0) | BELOW_NORMAL
+                kwargs["creationflags"] = flags
+            return _orig_popen(*args, **kwargs)
+
+        if not getattr(pytesseract.pytesseract, "_lowprio_installed", False):  # type: ignore[attr-defined]
+            pytesseract.pytesseract.subprocess.Popen = _lowprio_popen          # type: ignore[attr-defined]
+            pytesseract.pytesseract._lowprio_installed = True                  # type: ignore[attr-defined]
+    except Exception:
+        # 실패해도 기능 저하 없음
+        pass
+
+
+# 모듈 로드 시 1회 설치
+_install_lowprio_for_tesseract()
+
 
 def _tess_cfg_and_env():
     """
@@ -66,6 +116,20 @@ def _is_subsequence(sub: str, base: str) -> bool:
     return all(ch in it for ch in sub)
 
 
+_OOTR_CHARS = set("순위권이탈")
+
+
+def _hangul_subset_of_ootr(text: str) -> bool:
+    """OCR 결과의 한글이 모두 '순위권이탈' 문자 집합에만 속하는지 확인.
+    느슨한 폴백용: 패턴 매칭이 실패해도 순위권이탈 관련 한글만 보이면 True 반환.
+    '갱신권' 등 다른 뱃지 한글은 집합 외 문자를 포함하므로 False가 됨.
+    """
+    hangul = _only_hangul(text)
+    if not hangul:
+        return False
+    return all(ch in _OOTR_CHARS for ch in hangul)
+
+
 def _match_out_of_range_ko(text: str) -> bool:
     """
     '순위권 이탈(임시 텍스트. 추후 변경 필요)'을 부분적으로라도 인식했는지 판단.
@@ -83,6 +147,28 @@ def _match_out_of_range_ko(text: str) -> bool:
     if _is_subsequence(s, base) and len(s) >= 2:
         return True
     return False
+
+
+def _likely_korean_not_digits(pil_img) -> bool:
+    """
+    컨투어 수 기반 한글/숫자 판별. Tesseract가 완전히 실패한 경우의 최후 수단.
+
+    근거:
+    - 등수 숫자 1~9999 (최대 4자리): 외부 컨투어(획 덩어리) 최대 4개
+    - 한글 2글자 이상: 각 음절이 여러 획으로 이뤄져 통상 6개 이상
+
+    preprocess_digits 를 거쳐 노이즈/작은 텍스트를 제거한 뒤 카운트.
+    임계값 6 → 4자리 숫자(≤4)와 한글(≥6) 사이에 충분한 여유.
+    """
+    try:
+        import cv2
+        import numpy as np
+        img = preprocess_digits(pil_img)
+        arr = np.array(img)
+        cnts, _ = cv2.findContours(arr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return len(cnts) >= 6
+    except Exception:
+        return False
 
 
 def set_tesseract_path(tesseract_path: str) -> None:
@@ -389,6 +475,36 @@ def resolve_tessdata_dir() -> str:
         return _RESOLVED_TESSDATA_DIR
 
 
+def _keep_large_components(img_l):
+    """
+    이진화된 L-mode 이미지에서 최대 높이의 40% 미만 connected component를 제거.
+    주변 작은 텍스트/노이즈 필터링 (큰 숫자만 남긴다).
+    혼합 크기가 없으면(모두 비슷한 높이) 필터를 적용하지 않는다.
+    """
+    try:
+        import cv2
+        import numpy as np
+        arr = np.array(img_l)
+        binary = (arr > 127).astype(np.uint8)
+        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(cnts) < 2:
+            return img_l
+        heights = [cv2.boundingRect(c)[3] for c in cnts if cv2.boundingRect(c)[3] > 4]
+        if not heights:
+            return img_l
+        max_h = max(heights)
+        thr_h = max_h * 0.30
+        if all(h >= thr_h for h in heights):
+            return img_l  # 모두 비슷한 크기 → 필터 불필요
+        mask = np.zeros_like(arr)
+        for c in cnts:
+            if cv2.boundingRect(c)[3] >= thr_h:
+                cv2.drawContours(mask, [c], -1, 255, -1)
+        return Image.fromarray(np.where(mask > 0, arr, 0).astype(np.uint8))
+    except Exception:
+        return img_l
+
+
 def preprocess_digits(pil_image, upscale: float = 1.25, threshold: int = 170):
     img = pil_image.convert("L")
     img = ImageOps.autocontrast(img)
@@ -398,7 +514,9 @@ def preprocess_digits(pil_image, upscale: float = 1.25, threshold: int = 170):
     img = img.filter(ImageFilter.MedianFilter(size=3))
     # 고정 임계값(후속 튜닝 여지). 실패 케이스 쌓이면 OTSU/적응형 옵션 분기 검토
     img = img.point(lambda p: 255 if p > threshold else 0, mode="1")
-    return img.convert("L")
+    img = img.convert("L")
+    img = _keep_large_components(img)  # 주변 작은 글자/노이즈 제거 (큰 숫자만 유지)
+    return img
 
 
 def read_digits(pil_image) -> str:
@@ -491,28 +609,70 @@ def parse_rank_text(text: str):
 
 
 def get_available_languages(tessdata_dir: Optional[str] = None) -> set[str]:
-    """tessdata 폴더에서 *.traineddata만 스캔해 언어 코드를 얻는다(초고속)."""
+    """tessdata 폴더에서 *.traineddata만 스캔해 언어 코드를 얻는다(초고속). 결과 캐시."""
     td = tessdata_dir or resolve_tessdata_dir()
+    if td in _AVAIL_LANGS_CACHE:
+        return _AVAIL_LANGS_CACHE[td]
     try:
-        return {
+        result = {
             name[:-12]  # '.traineddata' 제거
             for name in os.listdir(td)
             if name.lower().endswith(".traineddata")
         }
     except Exception:
-        return set()
+        result = set()
+    _AVAIL_LANGS_CACHE[td] = result
+    return result
 
 
 def read_rank_out_of_range_ko(pil_img):
     cfg, restore = _tess_cfg_and_env()
     try:
-        img = preprocess_text(pil_img, upscale=1.5)
-        cfg_full = (cfg + r" --psm 7 -c tessedit_char_whitelist=순위권이탈").strip()
-        try:
-            txt = pytesseract.image_to_string(img, lang="kor", config=cfg_full) or ""
-        except Exception:
-            txt = ""
-        return txt.strip()
+        # 빠른 컨투어 게이트: 획 덩어리가 적으면 숫자(등수)일 가능성이 높음 → Tesseract 호출 생략
+        # 등수 1~9999(최대 4자리): 외부 컨투어 ≤ 5, 한글 2자 이상: 통상 ≥ 6
+        if not _likely_korean_not_digits(pil_img):
+            return ""
+
+        # '순위권 이탈'은 큰 숫자보다 폰트가 작아 upscale을 높게 → psm 7(한 줄), 6(블록) 순 시도
+        any_ootr_hangul = False
+
+        # Pass 1: kor 단독 — 엄격한 패턴 매칭 + 느슨한 문자집합 폴백
+        for upscale_factor, psm in ((3.0, 7), (3.0, 6), (1.5, 7)):
+            img = preprocess_text(pil_img, upscale=upscale_factor)
+            cfg_full = (cfg + f" --psm {psm}").strip()
+            try:
+                txt = pytesseract.image_to_string(img, lang="kor", config=cfg_full) or ""
+            except Exception:
+                continue
+            txt = txt.strip()
+            if _match_out_of_range_ko(txt):
+                return txt
+            if _hangul_subset_of_ootr(txt):
+                any_ootr_hangul = True
+
+        # Pass 2: kor+eng 혼합 — 글자가 잘린 경우 kor 단독으로 한글을 아예 못 읽을 때 보완.
+        # eng가 잘린 부분을 digit으로 읽더라도, kor이 나머지 한글을 함께 출력해 문자집합 검출 가능.
+        avail = get_available_languages()
+        if "kor" in avail and "eng" in avail:
+            for upscale_factor, psm in ((3.0, 7), (3.0, 6)):
+                img = preprocess_text(pil_img, upscale=upscale_factor)
+                cfg_full = (cfg + f" --psm {psm}").strip()
+                try:
+                    txt = pytesseract.image_to_string(img, lang="kor+eng", config=cfg_full) or ""
+                except Exception:
+                    continue
+                txt = txt.strip()
+                if _match_out_of_range_ko(txt):
+                    return txt
+                if _hangul_subset_of_ootr(txt):
+                    any_ootr_hangul = True
+
+        if any_ootr_hangul:
+            return "순위권 이탈"
+
+        # Pass 3: 게이트는 통과했지만 Tesseract 5번 모두 한글을 못 읽음 → 확신 없음, 빈 문자열 반환
+        # (뱃지/노이즈가 포함돼 컨투어 수가 많아진 경우 false-positive 방지)
+        return ""
     finally:
         restore()
 

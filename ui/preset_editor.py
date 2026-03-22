@@ -126,7 +126,10 @@ class PresetEditorDialog(ctk.CTkToplevel):
         self.settings.set("goal.active_preset_id", self.active_id)
         self.settings.set("goal.confirm_samples", g.get("confirm_samples", 3))
         self.settings.set("goal.confirm_window_ms", g.get("confirm_window_ms", 1500))
-        self.settings.save()
+        try:
+            self.settings.flush_debounced(immediate=True)
+        except Exception:
+            self.settings.save()
 
         # 숫자 입력 바인딩 변수
         self.var_rank_target = tk.StringVar(value="20")
@@ -208,7 +211,9 @@ class PresetEditorDialog(ctk.CTkToplevel):
         # 하단: 저장/닫기
         bar = ctk.CTkFrame(form)
         bar.grid(row=r+1, column=0, columnspan=2, sticky="we", padx=6, pady=(10, 0))
-        ctk.CTkButton(bar, text="저장/적용", command=self._on_save).pack(side="left", padx=(0, 8))
+        self.btn_save = ctk.CTkButton(bar, text="저장/적용",
+                                      command=lambda: self._on_save(self.btn_save))
+        self.btn_save.pack(side="left", padx=(0, 8))
         ctk.CTkButton(bar, text="닫기", command=self.destroy).pack(side="left")
 
         # 우측: 목록(좁게) + 버튼
@@ -343,41 +348,82 @@ class PresetEditorDialog(ctk.CTkToplevel):
             return {}
         return p
 
-    def _on_save(self):
-        pid = self._current_pid()
-        if not pid:
-            messagebox.showerror("저장 실패", "선택된 프리셋이 없습니다.")
+    def _on_save(self, btn):
+        if getattr(self, "_save_in_progress", False):
             return
-        p = self._collect_form()
-        if not p:
-            return
-
-        self.presets[pid] = p
-
-        # settings 반영
-        self.settings.set("goal.presets", self.presets)
-        g = self.settings.get("goal", {}) or {}
-        self.active_id = g.get("active_preset_id", self.active_id) or pid
-        if self.active_id not in self.presets:
-            self.active_id = pid
-        self.settings.set("goal.active_preset_id", self.active_id)
-        self.settings.save()
-
-        # provider 갱신 + 콤보 새로고침
+        self._save_in_progress = True
         try:
-            if hasattr(self.parent_app, "goal_provider"):
-                self.parent_app.goal_provider.reload_from_settings()
-        except Exception:
-            pass
-        try:
-            if hasattr(self.parent_app, "_refresh_goal_combo"):
-                self.parent_app._refresh_goal_combo()
+            btn.configure(state="disabled", text="저장 중…")
         except Exception:
             pass
 
-        # ★ 목록 즉시 갱신 (이 줄들이 없어서 반영이 안 됐음)
-        self._reload_list()
-        self._select_id(pid)   # ← 기존 self._select_id(self.active_id) 를 pid로 교체
+        # 스레드 시작 전, 현재 폼 값을 활성 프리셋에 반영(메인 스레드에서만 위젯 접근)
+        pid = self._current_pid() or self.active_id
+        data = self._collect_form()
+        if not data:  # 수집/검증 실패 시 버튼 언락 후 반환
+            try:
+                btn.configure(text="저장/적용", state="normal")
+            except Exception:
+                pass
+            self._save_in_progress = False
+            return
+        self.presets[pid] = data
+        self.active_id = pid
 
-        messagebox.showinfo("저장 완료", "프리셋이 저장되었습니다.")
+        import threading
+
+        def _work():
+            try:
+                # 수집/검증
+                ok, msg = True, ""
+                # (기존 validate_preset 여러 개 돌리는 루틴 그대로 사용)
+                for pid, p in self.presets.items():
+                    ok, msg = validate_preset(p)
+                    if not ok: break
+                if not ok:
+                    def _bad():
+                        from tkinter import messagebox
+                        messagebox.showwarning("검증 실패", msg, parent=self)
+
+                    self.after(0, _bad)
+                    return
+
+                # 저장
+                self.settings.set("goal.presets", self.presets)
+                self.settings.set("goal.active_preset_id", self.active_id)
+                try:
+                    self.settings.flush_debounced(immediate=True)
+                except Exception:
+                    self.settings.save()
+
+                # --- read-back 검증 추가 ---
+                try:
+                    rb_presets = dict(self.settings.get("goal.presets", {})) or {}
+                    rb_active = self.settings.get("goal.active_preset_id", None)
+                    ok = (rb_active == self.active_id) and (
+                                rb_presets.get(self.active_id) == self.presets.get(self.active_id))
+                    if not ok:
+                        from tkinter import messagebox
+                        self.after(0, lambda: messagebox.showwarning(
+                            "저장 확인", "프리셋 일부가 저장 파일에 정확히 반영되지 않았습니다.", parent=self))
+                except Exception:
+                    pass
+
+                # 완료 안내(필요 시)
+                def _done():
+                    from tkinter import messagebox
+                    messagebox.showinfo("완료", "프리셋을 저장했습니다.", parent=self)
+
+                self.after(0, _done)
+            finally:
+                def _unlock():
+                    try:
+                        btn.configure(text="저장/적용", state="normal")
+                    except Exception:
+                        pass
+                    setattr(self, "_save_in_progress", False)
+
+                self.after(0, _unlock)
+
+        threading.Thread(target=_work, daemon=True).start()
 

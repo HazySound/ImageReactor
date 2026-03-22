@@ -2,11 +2,11 @@
 from __future__ import annotations
 import os, json
 from typing import Optional
+import path_manager as pm
 
 
 def load_home_anchor_threshold(default: float = 0.88) -> float:
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ptr_path = os.path.join(root_dir, "home_anchor.json")
+    ptr_path = str(pm.BASE_DIR / "home_anchor.json")
     try:
         if not os.path.exists(ptr_path):
             return float(default)
