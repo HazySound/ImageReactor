@@ -1,0 +1,73 @@
+[
+  {
+    "image": "test.png",
+    "action": "click",
+    "order": 0,
+    "conf": 0.8
+  },
+  {
+    "image": "s2.png",
+    "action": "click",
+    "order": 1,
+    "conf": 0.8
+  },
+  {
+    "image": "s3.png",
+    "action": "space",
+    "order": 2,
+    "conf": 0.8
+  },
+  {
+    "image": "s1.png",
+    "action": "click",
+    "order": 3,
+    "conf": 0.8
+  },
+  {
+    "image": "s4.png",
+    "action": "space",
+    "order": 4,
+    "conf": 0.8
+  },
+  {
+    "image": "s.png",
+    "action": "s",
+    "order": 5,
+    "conf": 0.8
+  },
+  {
+    "image": "tac.PNG",
+    "action": "click",
+    "order": 6,
+    "conf": 0.9
+  },
+  {
+    "image": "esc.png",
+    "action": "esc",
+    "order": 7,
+    "conf": 0.8
+  },
+  {
+    "image": "skip.png",
+    "action": "s",
+    "order": 8,
+    "conf": 0.8
+  },
+  {
+    "image": "s5.png",
+    "action": "click",
+    "order": 9,
+    "conf": 0.8
+  },
+  {
+    "image": "s6.PNG",
+    "action": "click",
+    "order": 10,
+    "conf": 0.8
+  },
+  {
+    "image": "cl_test.png",
+    "action": "Client",
+    "conf": 0.9
+  }
+]

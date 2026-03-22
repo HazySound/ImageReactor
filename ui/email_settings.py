@@ -194,6 +194,7 @@ class EmailSettingsDialog(ctk.CTkToplevel):
     def _on_save(self, btn):
         if getattr(self, "_save_in_progress", False):
             return
+
         cfg = self._collect()
         if cfg is None:
             return
@@ -217,6 +218,21 @@ class EmailSettingsDialog(ctk.CTkToplevel):
                 except Exception:
                     # 디바운스 미구현일 수도 있으니 안전하게 직접 저장
                     self.settings.save()
+
+                # --- read-back 검증 추가 ---
+                try:
+                    rb = dict(self.settings.get("email", {})) or {}
+                    # 입력과 저장값이 핵심 키에서 일치하는지만 확인(전체 비교 아님)
+                    keys = ("enabled", "provider", "smtp_host", "smtp_port", "use_tls", "sender",
+                            "app_password", "recipients", "subject_tmpl", "body_tmpl")
+                    ok = all(rb.get(k) == cfg.get(k) for k in keys)
+                    if not ok:
+                        self.after(0, lambda: messagebox.showwarning(
+                            "저장 확인", "일부 이메일 설정이 파일에 정확히 반영되지 않았습니다.", parent=self))
+                except Exception:
+                    # 검증 실패는 치명 아님 → 무시
+                    pass
+
                 # 런타임 적용
                 self._apply_live(cfg)
                 # UI 스레드에서 알림/종료

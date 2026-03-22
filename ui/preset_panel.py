@@ -47,7 +47,22 @@ class PresetEditorPanel(ctk.CTkFrame):
     def _save_state(self):
         self.settings.set("goal.presets", self.presets)
         self.settings.set("goal.active_preset_id", self.active_id)
-        self.settings.save()
+        try:
+            self.settings.flush_debounced(immediate=True)
+        except Exception:
+            # 디바운스 미구현 환경 폴백
+            self.settings.save()
+
+        # --- read-back 검증 추가 ---
+        try:
+            rb_presets = dict(self.settings.get("goal.presets", {})) or {}
+            rb_active = self.settings.get("goal.active_preset_id", None)
+            ok = (rb_active == self.active_id) and (rb_presets.get(self.active_id) == self.presets.get(self.active_id))
+            if not ok:
+                from tkinter import messagebox
+                messagebox.showwarning("저장 확인", "프리셋 일부가 저장 파일에 정확히 반영되지 않았습니다.", parent=self)
+        except Exception:
+            pass
 
     # ----- ui -----
     def _build_ui(self):
@@ -171,7 +186,10 @@ class PresetEditorPanel(ctk.CTkFrame):
         self.ent_name.delete(0,"end"); self.ent_name.insert(0, p.get("name","프리셋"))
         self.type_ui.set(VAL2UI.get(p.get("type","rank"), "등수"))
         self.ent_rank_target.delete(0,"end");   self.ent_rank_target.insert(0, str(p.get("rank_target",20)))
-        self.ent_rank_margin.delete(0,"end");   self.ent_rank_margin.insert(0, str(p.get("rank_margin",0)))
+        self.ent_rank_margin.delete(0, "end")
+        self.ent_rank_margin.insert(0, str(
+            p.get("rank_margin", p.get("rank_tolerance", 0))
+        ))
         self.ent_points_target.delete(0,"end"); self.ent_points_target.insert(0, str(p.get("points_target",0)))
         self.ent_points_margin.delete(0,"end"); self.ent_points_margin.insert(0, str(p.get("points_margin",0)))
         self._on_type_change()
@@ -202,6 +220,8 @@ class PresetEditorPanel(ctk.CTkFrame):
         except ValueError:
             messagebox.showerror("오류", "숫자 항목에 정수를 입력하세요.")
             return
+        # 호환성: rank_tolerance 키도 함께 기록(과거 코드와 공존)
+        p["rank_tolerance"] = p.get("rank_margin", 0)
         self._save_state(); self._reload_list()
         messagebox.showinfo("저장", "프리셋이 저장되었습니다.")
 

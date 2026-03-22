@@ -126,7 +126,10 @@ class PresetEditorDialog(ctk.CTkToplevel):
         self.settings.set("goal.active_preset_id", self.active_id)
         self.settings.set("goal.confirm_samples", g.get("confirm_samples", 3))
         self.settings.set("goal.confirm_window_ms", g.get("confirm_window_ms", 1500))
-        self.settings.save()
+        try:
+            self.settings.flush_debounced(immediate=True)
+        except Exception:
+            self.settings.save()
 
         # 숫자 입력 바인딩 변수
         self.var_rank_target = tk.StringVar(value="20")
@@ -354,6 +357,19 @@ class PresetEditorDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
+        # 스레드 시작 전, 현재 폼 값을 활성 프리셋에 반영(메인 스레드에서만 위젯 접근)
+        pid = self._current_pid() or self.active_id
+        data = self._collect_form()
+        if not data:  # 수집/검증 실패 시 버튼 언락 후 반환
+            try:
+                btn.configure(text="저장/적용", state="normal")
+            except Exception:
+                pass
+            self._save_in_progress = False
+            return
+        self.presets[pid] = data
+        self.active_id = pid
+
         import threading
 
         def _work():
@@ -379,6 +395,19 @@ class PresetEditorDialog(ctk.CTkToplevel):
                     self.settings.flush_debounced(immediate=True)
                 except Exception:
                     self.settings.save()
+
+                # --- read-back 검증 추가 ---
+                try:
+                    rb_presets = dict(self.settings.get("goal.presets", {})) or {}
+                    rb_active = self.settings.get("goal.active_preset_id", None)
+                    ok = (rb_active == self.active_id) and (
+                                rb_presets.get(self.active_id) == self.presets.get(self.active_id))
+                    if not ok:
+                        from tkinter import messagebox
+                        self.after(0, lambda: messagebox.showwarning(
+                            "저장 확인", "프리셋 일부가 저장 파일에 정확히 반영되지 않았습니다.", parent=self))
+                except Exception:
+                    pass
 
                 # 완료 안내(필요 시)
                 def _done():

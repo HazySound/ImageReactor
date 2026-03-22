@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import path_manager as pm  # 절대 임포트
 
-HOME_ANCHOR_PATH = Path("home_anchor.json")  # ★ 상대경로
+HOME_ANCHOR_PATH = pm.BASE_DIR / "home_anchor.json"  # 절대경로(exe 폴더 기준)
 
 
 def _pick_template_field(d: dict) -> str | None:

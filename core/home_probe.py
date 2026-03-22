@@ -183,8 +183,9 @@ def get_home_anchor_template(image_folder: str, routine: list) -> Optional[str]:
     - 파일명만 사용(디렉터리 무시), 유니코드/대소문자 정규화.
     """
     try:
-        # 1) 포인터 파일: 현재 작업 디렉터리에서 직접 찾음 (exe 옆)
-        ptr_path = os.path.join(os.getcwd(), "home_anchor.json")
+        # 1) 포인터 파일: exe 폴더(BASE_DIR) 기준 절대경로로 찾음
+        import path_manager as pm
+        ptr_path = str(pm.BASE_DIR / "home_anchor.json")
         if not os.path.exists(ptr_path):
             return None
 

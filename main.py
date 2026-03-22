@@ -23,7 +23,7 @@ from pathlib import Path
 from core.settings_manager import SettingsManager
 from core.goal_policy import GoalPolicy, build_goal_policy
 import cv2, numpy as np
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, Set, Tuple, Optional, Callable, Any
 from core.home_probe import HomeProbe, get_home_anchor_template  # 홈 확인 루틴/헬퍼
 from core.state_store import get_state_store  # OCR 중 UI잠금 플래그 :contentReference[oaicite:3]{index=3}
 from core.utils_anchor import load_home_anchor_threshold
@@ -36,20 +36,246 @@ from core.roi_from_settings import (
     read_rois_xywh_from_settings,         # ← ROI (x,y,w,h) 그대로 읽기
     scale_xywh_from_base                  # ← (x,y,w,h) 스케일 함수
 )  # ← 신규 모듈
+from core.scheduled_shutdown import ScheduledShutdown
 
 
 width, height = pgi.size()  # 화면해상도 확인
 
 # ★ 성능/주기 설정(없으면 안전 기본값)
-# ★ settings.json SSOT (Single Source Of Truth)
-SETTINGS = SettingsManager(SETTINGS_JSON)  # pm.DATA_DIR 하의 공식 경로
-_LOOP_INTERVAL_SEC = float(SETTINGS.get("perf.loop_interval_sec", 0.45))   # 루틴 호출 간격
-_IDLE_SLEEP_SEC = float(SETTINGS.get("perf.idle_sleep_sec", 0.016))      # 내부 idle 슬립
-_AWAIT_STEP_MIN_MS = int(SETTINGS.get("perf.await_step_min_ms", 140))      # AWAIT 프레임 간격
+# ---- Settings SSOT 주입/지연 초기화 ----
+_SETTINGS_SM = None  # type: Optional[SettingsManager]
+
+# --- status logger (GUI로부터 주입) ---
+# 항상 callable로 유지해 IDE/타입체커 경고 제거
+_STATUS_LOGGER: Callable[[str, Optional[str]], None] = lambda msg, fg=None: print(msg)
+
+
+def _goal_enabled_now() -> bool:
+    try:
+        return bool(SETTINGS().get("goal.enabled", False))
+    except Exception:
+        return False
+
+
+def set_status_logger(fn: Any) -> None:
+    """
+    주입받은 로거를 (text, fg=None) 시그니처로 통일하는 래퍼를 셋업.
+    - fn이 logging.Logger 계열이면 .info(text)
+    - fn이 callable(text, fg)면 그대로
+    - fn이 callable(text)만 받으면 그 형태로 호출
+    - 그 외는 기본 print로 유지
+    """
+    global _STATUS_LOGGER
+
+    # 1) 로거 객체(.info) 지원
+    if hasattr(fn, "info") and callable(getattr(fn, "info")):
+        def _wrapped(msg: str, fg: Optional[str] = None) -> None:
+            try:
+                fn.info(msg)
+            except Exception:
+                pass
+        _STATUS_LOGGER = _wrapped
+        return
+
+    # 2) 일반 callable
+    if callable(fn):
+        def _wrapped(msg: str, fg: Optional[str] = None) -> None:
+            try:
+                # (text, fg) 시도
+                return fn(msg, fg)
+            except TypeError:
+                # (text)만 받을 때
+                return fn(msg)
+            except Exception:
+                pass
+        _STATUS_LOGGER = _wrapped
+        return
+
+    # 3) 잘못된 주입 → 기본값 유지(이미 print 래퍼)
+    # 아무 것도 하지 않음
+
+
+def _log_status(text: str, fg: Optional[str] = None) -> None:
+    """
+    main 내부 상태 로그 출력.
+    - GUI에서 set_status_logger로 주입되면 (text, fg) 호출
+    - (text)만 받는 구버전 브릿지도 허용
+    - 미주입/호출 실패 시 콘솔 print로 폴백
+    """
+    try:
+        cb = _STATUS_LOGGER  # 주입 안 됐으면 NameError는 안 나고 기본 print 래퍼일 수 있음
+    except NameError:
+        cb = None
+
+    if callable(cb):
+        try:
+            cb(text, fg)      # 선호 시그니처
+            return
+        except TypeError:
+            try:
+                cb(text)      # (text)만 받는 구버전
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # 최종 폴백
+    try:
+        print(text)
+    except Exception:
+        pass
+
+
+def set_settings_manager(sm):
+    global _SETTINGS_SM
+    _SETTINGS_SM = sm
+
+
+def SETTINGS() -> SettingsManager:
+    """
+    SSOT 접근자. GUI가 set_settings_manager로 주입하면 그대로 사용,
+    아니면 단독 실행 시 1회만 생성.
+    """
+    global _SETTINGS_SM
+    if _SETTINGS_SM is None:
+        from core.settings_manager import SettingsManager  # 상단 import 유지 가능
+        _SETTINGS_SM = SettingsManager(SETTINGS_JSON)
+    return _SETTINGS_SM
+
+
+# 예약 종료 컨트롤러 준비
+_SCHED_SD = ScheduledShutdown(
+    settings_getter=lambda: SETTINGS(),
+    stop_callback=lambda: stop_event.set() if 'stop_event' in globals() else None
+)
+
+
+def reload_scheduled_shutdown():
+    """settings.json 저장 직후 즉시 재적용을 위해 외부(UI)에서 호출."""
+    try:
+        _SCHED_SD.reload_from_settings()
+    except Exception:
+        pass
+
+
+def reload_spam_mode_from_settings(changed_keys: list[str] | None = None) -> None:
+    """
+    settings.json 저장 직후 스팸 모드 설정을 인메모리로 재적용.
+    - enabled, enter_images, exit_images, press_key, interval_ms, conf
+    - 잘못된 타입/값은 안전한 기본으로 정규화
+    - 비활성화로 전환되면 활성 상태일 경우 즉시 종료
+    """
+    try:
+        s = SETTINGS().get("spam_mode", {}) or {}
+        enabled = bool(s.get("enabled", False))
+
+        enter = s.get("enter_images") or []
+        exit_  = s.get("exit_images") or []
+        if not isinstance(enter, (list, tuple)): enter = []
+        if not isinstance(exit_,  (list, tuple)): exit_  = []
+
+        key = str(s.get("press_key", "s")).strip().lower() or "s"
+        itv = int(s.get("interval_ms", 60))
+        itv = max(10, min(itv, 500))  # 10~500ms로 가드
+        conf = float(s.get("conf", 0.80))  # 없으면 0.80
+        conf = max(0.50, min(conf, 0.99))
+
+        globals()["_SPAM_CFG"] = {
+            "enabled": enabled,
+            "enter": set([str(x).strip() for x in enter if str(x).strip()]),
+            "exit":  set([str(x).strip() for x in exit_  if str(x).strip()]),
+            "key": key,
+            "dt": itv,
+            "conf": conf,
+        }
+
+        # OFF로 바뀌었다면 즉시 해제
+        if not enabled and globals().get("_SPAM_ACTIVE", False):
+            try:
+                _spam_deactivate(reason="disabled via settings")
+            except Exception:
+                pass
+
+        log_spam_state()
+    except Exception:
+        pass
+
+
+def log_spam_state():
+    s = SETTINGS().get("spam_mode", {}) or {}
+    enabled = bool(s.get("enabled", False))
+
+    style = "green bold"
+    if enabled:
+        _log_status("스팸 모드 ON", fg=style)
+    else:
+        style = "gray bold"
+        _log_status("스팸 모드 OFF", fg=style)
+
+
+def log_scheduled_shutdown_state(enabled: bool, weekday_ko: str = "", hhmm: str = "", auto_poweroff: bool = False, delay_min: int = 20):
+    """
+    사용자에게 보여줄 상태 로그. '목표달성 모드: ON/OFF'와 유사한 스타일.
+    색상: 사이언(직관적으로 '예약/알림' 성격을 띔).
+    """
+    msg = "예약종료 모드: OFF"
+    style = "gray bold"
+    if enabled:
+        tail = f"{weekday_ko} {hhmm}"
+        tail += " · PC 자동 종료" if auto_poweroff else ""
+        tail += f" · 지연 {delay_min}분"
+        msg = f"예약종료 모드: {tail}"
+        style = "cyan bold"
+    # GUI 로그 위젯이 있으면 색상 출력, 없으면 print
+    # 출력
+    try:
+        _log_status(msg, fg=style)  # 사이언
+    except Exception:
+        pass
+
+
+def log_scheduled_shutdown_state_current():
+    """
+    settings.schedule 스냅샷을 읽어 현재 예약 종료 상태를 GUI 로그(시안)로 1줄 요약.
+    - entries[0]만 요약에 사용(다중 항목 UI면 활성/선택 항목을 GUI에서 넘겨도 OK)
+    - UI가 따로 값을 넘겨주지 못할 때 호출하기 위한 편의 함수
+    """
+    try:
+        s = SETTINGS().get("schedule", {}) or {}
+        enabled = bool(s.get("enabled", False))
+        entries = s.get("entries", []) or []
+        weekday_ko = ""
+        hhmm = ""
+        if enabled and entries:
+            wd = entries[0].get("weekday")
+            tm = str(entries[0].get("time", "")).strip()
+            # 요일 → 한글
+            _day = {
+                0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일",
+                "mon": "월", "tue": "화", "wed": "수", "thu": "목", "fri": "금", "sat": "토", "sun": "일",
+            }
+            if isinstance(wd, int):
+                weekday_ko = f"{_day.get(wd, wd)}요일"
+            elif isinstance(wd, str):
+                weekday_ko = f"{_day.get(wd.strip().lower(), wd)}요일"
+            hhmm = tm
+
+        auto_poweroff = bool(s.get("auto_poweroff", int(s.get("shutdown_delay_min", 0)) > 0))
+        delay_min = int(s.get("shutdown_delay_min", 20))
+        log_scheduled_shutdown_state(enabled, weekday_ko, hhmm, auto_poweroff, delay_min)
+    except Exception:
+        pass
+
+
+# ↓ 모든 전역 상수 계산부를 함수화/지연화하거나, 초기화 시점에만 한 번 읽도록 변경
+_LOOP_INTERVAL_SEC = float(SETTINGS().get("perf.loop_interval_sec", 0.45))
+_IDLE_SLEEP_SEC    = float(SETTINGS().get("perf.idle_sleep_sec", 0.016))
+_AWAIT_STEP_MIN_MS = int(SETTINGS().get("perf.await_step_min_ms", 140))
 
 # --- GUI busy 워치독/스로틀 파라미터 ---
-_BUSY_WATCHDOG_MS = int(SETTINGS.get("perf.busy_watchdog_ms", 2000))   # 2s
-_BUSY_THROTTLE_SEC = float(SETTINGS.get("perf.busy_throttle_sec", 0.35))# 350ms
+_BUSY_WATCHDOG_MS = int(SETTINGS().get("perf.busy_watchdog_ms", 2000))   # 2s
+_BUSY_THROTTLE_SEC = float(SETTINGS().get("perf.busy_throttle_sec", 0.35))# 350ms
 
 # --- busy 워치 상태(전역) ---
 _BUSY_SINCE_MS: int = 0
@@ -63,15 +289,17 @@ res_path = pm.get_res_path()
 is_crashed = False
 
 # OCR ROI 설정: settings.ocr.* 사용 (없으면 안전값)
-roi_rank = SETTINGS.get("ocr.roi_rank")
+roi_rank = SETTINGS().get("ocr.roi_rank")
 # 구버전 키 호환: roi_score → roi_points
-roi_points = SETTINGS.get("ocr.roi_points", SETTINGS.get("ocr.roi_score"))
+roi_points = SETTINGS().get("ocr.roi_points", SETTINGS().get("ocr.roi_score"))
+
+freeze = None  # ← 없으면 반드시 추가 (FreezeMonitor 활성화 보장)
 
 # --- OCR base screen size (settings에 저장된 기준 해상도) ---
 try:
     _OCR_BASE_WH = None
-    _bw = SETTINGS.get("ocr.screen.w")
-    _bh = SETTINGS.get("ocr.screen.h")
+    _bw = SETTINGS().get("ocr.screen.w")
+    _bh = SETTINGS().get("ocr.screen.h")
     if _bw and _bh:
         _OCR_BASE_WH = (int(_bw), int(_bh))
 except Exception:
@@ -91,18 +319,18 @@ def _sync_screen_profile() -> None:
     """
     try:
         cur_wh = (width, height)
-        cfg_w = SETTINGS.get("ocr.screen.w")
-        cfg_h = SETTINGS.get("ocr.screen.h")
+        cfg_w = SETTINGS().get("ocr.screen.w")
+        cfg_h = SETTINGS().get("ocr.screen.h")
         cfg_wh = (int(cfg_w), int(cfg_h)) if (cfg_w and cfg_h) else None
     except Exception:
         cfg_wh = None
 
     if cfg_wh != cur_wh:
         # settings 갱신 + 원자 저장
-        SETTINGS.set("ocr.screen.w", cur_wh[0])
-        SETTINGS.set("ocr.screen.h", cur_wh[1])
+        SETTINGS().set("ocr.screen.w", cur_wh[0])
+        SETTINGS().set("ocr.screen.h", cur_wh[1])
         try:
-            SETTINGS.save()  # 원자 저장(임시파일→replace)
+            SETTINGS().save()  # 원자 저장(임시파일→replace)
         except Exception:
             pass
 
@@ -121,7 +349,7 @@ _PLACEHOLDER_PW = "password"
 # [추가] 프로젝트 OCR 모듈에 테서랙트 경로 주입(있을 때만)
 try:
     from core import ocr as _ocr_core
-    _ocr_core.set_tesseract_path(SETTINGS.get("ocr.tesseract_path", ""))
+    _ocr_core.set_tesseract_path(SETTINGS().get("ocr.tesseract_path", ""))
 except Exception:
     pass
 
@@ -181,11 +409,13 @@ _SKIP_FILE_ROI_ONCE: bool = False  # 홈 miss 후 '다음 1회'는 풀프레임 
 # 루틴 이미지별 ROI 캐시(메모리)
 # 루틴 이미지별 ROI 캐시(메모리, 다중 후보 지원: 최신 우선)
 _ROUTINE_ROI: dict[str, list[tuple[int,int,int,int]]] = {}
-_MAX_ROI_CANDIDATES = int(SETTINGS.get("routine.roi_max_candidates", 3))
+_MAX_ROI_CANDIDATES = int(SETTINGS().get("routine.roi_max_candidates", 3))
 # 루틴 ROI 여유 마진(px) — settings 없으면 기본 12px
-_ROUTINE_ROI_MARGIN: int = int(SETTINGS.get("routine.roi_margin", 12))
+_ROUTINE_ROI_MARGIN: int = int(SETTINGS().get("routine.roi_margin", 12))
 # [ADD] AWAIT_HOME 세션 내 풀프레임 시도 누적(최대 2)
 _HOME_FF_TRIES: int = 0
+# [FIX] AWAIT_HOME 트리거 시점의 루틴 conf 저장 (probe 임계값 동기화용)
+_AWAIT_HOME_CONF: float = 0.80
 # --- 로그 레이트 리밋(공용) ---
 _LOG_LAST_TS = {}
 # --- AutoLearn 전역 ---
@@ -200,6 +430,20 @@ _RUNTIME_LOG_CB = None
 _WANT_AWAIT_HOME: bool = False   # 루틴 단락이 실제로 발생했을 때만 AWAIT_HOME 시작
 _HOME_OCR_DONE: bool = False     # '현재 홈 체류'에서 OCR을 1회 수행했는가
 
+# --- [SPAM MODE] 전역 ---
+_SPAM_CFG = {
+    "enabled": bool(SETTINGS().get("spam_mode.enabled", False)),
+    "enter": set(SETTINGS().get("spam_mode.enter_images", []) or []),
+    "exit":  set(SETTINGS().get("spam_mode.exit_images", []) or []),
+    "key":   str(SETTINGS().get("spam_mode.press_key", "s")),
+    "dt":    int(SETTINGS().get("spam_mode.interval_ms", 60)),
+    "conf":  float(SETTINGS().get("spam_mode.conf", 0.80)),
+}
+_SPAM_ACTIVE: bool = False
+_SPAM_LAST_TS: float = 0.0
+_SPAM_EXIT_CHECK_COOLDOWN_MS: int = 140   # 종료이미지 폴링 최소 간격(저부하)
+_SPAM_LAST_EXIT_POLL_TS: int = 0
+
 
 # [ADD] 공통 초기화: 토글 ON/OFF 전용
 def reset_runtime_state() -> None:
@@ -207,7 +451,7 @@ def reset_runtime_state() -> None:
     global _HOME_TPL_PATH, _HOME_SCREEN_WH, _CACHED_ROI, _LAST_BBOX, _SKIP_FILE_ROI_ONCE
     global _ROUTINE_ROI, _LOG_LAST_TS, _AUTOLEARN
     global _WANT_AWAIT_HOME, _HOME_OCR_DONE
-    global _HOME_FF_TRIES, _AWAIT_ENTER_MS
+    global _HOME_FF_TRIES, _AWAIT_HOME_CONF, _AWAIT_ENTER_MS
 
     probe = None
     cached_home_roi = None
@@ -217,6 +461,7 @@ def reset_runtime_state() -> None:
     _LAST_BBOX = None
     _SKIP_FILE_ROI_ONCE = False
     _HOME_FF_TRIES = 0
+    _AWAIT_HOME_CONF = 0.80
     _AWAIT_ENTER_MS = None
 
     _WANT_AWAIT_HOME = False
@@ -256,6 +501,105 @@ def _is_home_anchor(img_file: str) -> bool:
         return False
 
 
+def _basename(p: str) -> str:
+    try:
+        import os
+        return os.path.basename(p).strip()
+    except Exception:
+        return p
+
+
+def _is_spam_enter_image(img_file: str) -> bool:
+    if not _SPAM_CFG["enabled"]:
+        return False
+    name = _basename(img_file)
+    return name in _SPAM_CFG["enter"]
+
+
+def _is_spam_exit_hit(frame_bgr: "np.ndarray"):
+    """
+    반환값: (hit: bool, center: tuple|None, img_file: str|None)
+    """
+    if not _SPAM_CFG["enabled"]:
+        return False, None, None
+    conf = float(_SPAM_CFG["conf"])
+    for img_name in _SPAM_CFG["exit"]:
+        img_file = os.path.join(img_path, img_name)
+        if not os.path.exists(img_file):
+            continue
+        hit, center = _routine_locate_adaptive(img_file, conf)
+        if hit:
+            return True, center, img_file
+    return False, None, None
+
+
+def _spam_activate() -> None:
+    global _SPAM_ACTIVE, _SPAM_LAST_TS, _SPAM_LAST_EXIT_POLL_TS
+    _SPAM_ACTIVE = True
+    _SPAM_LAST_TS = 0.0
+    _SPAM_LAST_EXIT_POLL_TS = 0
+    try:
+        _log("[SPAM] 모드 진입: key=%s, dt=%sms" % (_SPAM_CFG["key"], _SPAM_CFG["dt"]))
+    except Exception:
+        pass
+
+    # [ADD] 스팸모드에서도 프리즈 모니터 활성화 보장
+    try:
+        global freeze
+        if freeze is None or getattr(freeze, "is_disabled", False):
+            freeze = FreezeMonitor.from_settings_dict(SETTINGS().get("freeze"), on_trip=_on_freeze_trip)
+        freeze.activate()
+    except Exception:
+        pass
+
+
+def _spam_deactivate() -> None:
+    global _SPAM_ACTIVE
+    _SPAM_ACTIVE = False
+    try:
+        _log("[SPAM] 모드 종료 → 루틴 복귀")
+    except Exception:
+        pass
+
+
+def _spam_tick() -> None:
+    """
+    - press_key를 interval 간격으로 1타 입력
+    - 저부하 간격으로 종료 이미지 탐지
+    """
+    import time
+    now_ms = int(time.time() * 1000)
+    global _SPAM_LAST_TS, _SPAM_LAST_EXIT_POLL_TS
+
+    # 1) 키 입력(연타)
+    if (_SPAM_LAST_TS == 0.0) or ((now_ms - int(_SPAM_LAST_TS)) >= int(_SPAM_CFG["dt"])):
+        _do_key(_SPAM_CFG["key"], label="spam", src_img=None)
+        _SPAM_LAST_TS = now_ms
+
+    # 2) 종료 이미지 폴링(저부하)
+    if (now_ms - _SPAM_LAST_EXIT_POLL_TS) >= _SPAM_EXIT_CHECK_COOLDOWN_MS:
+        frame_bgr = _capture_frame_bgr_like_gui()
+        hit, center, img_file = _is_spam_exit_hit(frame_bgr)
+        if hit:
+            # 전역 routine_items에서 동일 이미지의 액션을 찾아 1회 실행
+            try:
+                global routine_items  # 이미 전역으로 선언돼 있음
+                base = os.path.basename(img_file)
+                act = ""
+                for it in (routine_items or []):
+                    if os.path.basename(it.get("image", "")) == base:
+                        act = (it.get("action") or "").strip().lower()
+                        break
+                if act == "click" and center is not None:
+                    _do_click(center, label="exit_action", src_img=img_file)
+                elif act:
+                    _do_key(act, label="exit_action", src_img=img_file)
+            except Exception as e:
+                pass
+            _spam_deactivate()
+        _SPAM_LAST_EXIT_POLL_TS = now_ms
+
+
 def _roi_candidates(key: str) -> list[tuple[int,int,int,int]]:
     return _ROUTINE_ROI.get(key, [])
 
@@ -282,8 +626,8 @@ def _roi_key_for_image(image_filename: str) -> str:
 def _routine_roi_load(image_filename: str) -> list[tuple[int,int,int,int]]:
     # 해상도 프로파일 불일치 시 캐시 사용 금지
     try:
-        cfg_w = SETTINGS.get("ocr.screen.w")
-        cfg_h = SETTINGS.get("ocr.screen.h")
+        cfg_w = SETTINGS().get("ocr.screen.w")
+        cfg_h = SETTINGS().get("ocr.screen.h")
         if not (cfg_w and cfg_h) or int(cfg_w) != width or int(cfg_h) != height:
             return []
     except Exception:
@@ -389,6 +733,29 @@ def _log(msg: str) -> None:
         (cb or print)(msg)
     except Exception:
         print(msg)
+
+
+# --- Freeze trip global callback (for spam mode etc.) ---
+def _on_freeze_trip(count: int) -> None:
+    """
+    FreezeMonitor.on_trip 콜백 (모듈 전역).
+    스팸모드 등 어디서든 호출 가능해야 하므로 전역에 둔다.
+    """
+    try:
+        frz = globals().get("freeze", None)
+        interval = getattr(getattr(frz, "cfg", None), "interval_sec", 60)
+        minutes = (count * int(interval)) // 60
+    except Exception:
+        minutes = 0
+
+    _log(f"[FREEZE] 화면 정지 {count}회 샘플(≈{minutes}분) 감지 → 자동 이메일 발송")
+    try:
+        autoemail.send_email(event="freeze_detected",
+                             payload={"samples": int(count),
+                                      "approx_minutes": int(minutes),
+                                      "ts": int(time.time())})
+    except Exception as e:
+        _log(f"[FREEZE][email][err] {e}")
 
 
 def _ensure_roi_min_for_image(image_path: str, roi: tuple[int,int,int,int]) -> tuple[int,int,int,int]:
@@ -520,7 +887,7 @@ _DEFAULT_COOLDOWN_LOOPS = 5
 def _get_roi_params():
     """settings.routine.roi_fallback.{miss_threshold,cooldown_loops} → (int,int)"""
     # 전역 SettingsManager 사용(없으면 안전 기본값)
-    cfg = SETTINGS.get("routine.roi_fallback", {}) or {}
+    cfg = SETTINGS().get("routine.roi_fallback", {}) or {}
     miss_th = int(cfg.get("miss_threshold", _DEFAULT_MISS_THRESHOLD))
     cooldown = int(cfg.get("cooldown_loops", _DEFAULT_COOLDOWN_LOOPS))
 
@@ -529,7 +896,7 @@ def _get_roi_params():
 
 def _get_roi_margin():
     """settings.routine.roi_margin → int (기본 80)"""
-    return int(SETTINGS.get("routine.roi_margin", _ROUTINE_ROI_MARGIN))
+    return int(SETTINGS().get("routine.roi_margin", _ROUTINE_ROI_MARGIN))
 
 
 def _roi_key(img_basename: str) -> str:
@@ -563,7 +930,9 @@ def _do_click(center_xy: Optional[Tuple[int,int]], *, label: str = "", src_img: 
 def _do_key(key: str, *, label: str = "", src_img: str | None = None):
     try:
         pyd.keyDown(key); time.sleep(0.05); pyd.keyUp(key)
-        _log(f"[action] key '{key}'")
+        # 스팸모드에서는 키 로그 억제
+        if label != "spam":
+            _log(f"[action] key '{key}'")
     except Exception as e:
         _log(f"[action][err] key '{key}' failed: {e}")
 
@@ -577,7 +946,7 @@ def _home_ff_limiter_reset():
 def _get_taskbar_roi() -> tuple[int, int, int, int]:
     # Settings에 있으면 사용, 없으면 120px
     try:
-        band = int(SETTINGS.get("client.taskbar_band_px", 120))
+        band = int(SETTINGS().get("client.taskbar_band_px", 120))
     except Exception:
         band = 120
     band = max(40, min(band, height))  # 안전 범위
@@ -832,7 +1201,7 @@ def load_routine_from_json(path="./routine.json"):
 
 
 def execute_routine(routine_list):
-    global _HOME_OCR_DONE, _WANT_AWAIT_HOME
+    global _HOME_OCR_DONE, _WANT_AWAIT_HOME, _AWAIT_HOME_CONF
     for item in routine_list:
         img_file = img_path + item["image"]
         action = item["action"]
@@ -841,20 +1210,32 @@ def execute_routine(routine_list):
         if action in ("click", "space", "s", "esc"):
             hit, center = _routine_locate_adaptive(img_file, conf)
             if hit:
+                # [SPAM] 엔터 트리거: 이 이미지가 spam enter로 등록되었으면 루틴을 끊고 스팸 모드로
+                # (ready/준비완료 등에 매핑)
+                if _is_spam_enter_image(img_file):
+                    act = (item.get("action") or "").strip().lower()
+                    if act == "click" and center is not None:
+                        _do_click(center, label="enter_action", src_img=img_file)
+                    elif act:
+                        _do_key(act, label="enter_action", src_img=img_file)
+                    _spam_activate()
+                    return  # ← 루틴 실행 조기 종료 → 상위 루프에서 spam_tick만 수행
+
                 # --- [ADD] 홈 앵커 단락: 홈 템플릿이면 입력(클릭/키) 스킵 → 화면 전환 방지
                 # 바깥 루프가 직후 AWAIT_HOME(홈 OCR)을 기존 로직대로 시작한다.
                 # 이번 '홈 체류'에서 아직 OCR을 하지 않았을 때만 단락
                 if _is_home_anchor(img_file):
                     if not _HOME_OCR_DONE:
                         _WANT_AWAIT_HOME = True
+                        _AWAIT_HOME_CONF = float(conf)  # [FIX] probe 임계값 동기화
                         # 목표 ON에서만 조기 리턴 허용
                         try:
                             from core.goal_policy import GoalPolicy  # 이미 상단 import되어 있으면 생략
-                            goal_enabled = bool(SETTINGS.get("goal.enabled", False))
+                            goal_enabled = bool(SETTINGS().get("goal.enabled", False))
                         except Exception:
                             goal_enabled = False
 
-                        if goal_enabled:
+                        if goal_enabled and GOAL_AVAILABLE:
                             return
                     else:
                         _HOME_OCR_DONE = False
@@ -873,8 +1254,10 @@ def execute_routine(routine_list):
             # --- [ADD] 홈 앵커면 조합키도 스킵
             if _is_home_anchor(img_file):
                 if not _HOME_OCR_DONE:
-                    _WANT_AWAIT_HOME = True  # ← 이번 사이클에서만 AWAIT_HOME 허용
-                    return
+                    _WANT_AWAIT_HOME = True
+                    _AWAIT_HOME_CONF = float(conf)  # [FIX] probe 임계값 동기화
+                    if GOAL_AVAILABLE and bool(SETTINGS().get("goal.enabled", False)):
+                        return
                 else:
                     _HOME_OCR_DONE = False
             keys = [k.strip() for k in action.split('+')]
@@ -981,7 +1364,7 @@ def _read_metrics_from_current_home(frame_bgr):
     """
     # 이 함수는 core.roi_from_settings.run_home_ocr_like_gui()가
     # 위 3단계를 모두 내부에서 수행하도록 통일돼 있다.
-    return run_home_ocr_like_gui(frame_bgr, SETTINGS)
+    return run_home_ocr_like_gui(frame_bgr, SETTINGS())
 # debug 끝
 
 
@@ -993,7 +1376,7 @@ def _is_goal_met_by_settings(m: dict) -> bool:
     - 그 외/누락       : False
     """
     try:
-        g = SETTINGS.get("goal", {}) or {}
+        g = SETTINGS().get("goal", {}) or {}
         if not g.get("enabled", False):
             return False
         presets = g.get("presets", {}) or {}
@@ -1025,15 +1408,25 @@ def _is_goal_met_by_settings(m: dict) -> bool:
 
 
 def routine_loop(stop_event_global, state_cb, log_cb):
+    # 설정 최신화: GUI가 디스크에 저장한 값을 메인 인메모리로 강제 반영
+    try:
+        SETTINGS().flush_debounced(immediate=True)
+    except Exception:
+        pass
+    try:
+        SETTINGS().load()  # ★ 디스크 재로딩 (핵심)
+    except Exception:
+        pass
+
     # Goal 정책 초기화 (현재 settings.json 기준)
-    goal_policy = build_goal_policy(SETTINGS)
-    GOAL_ENABLED = bool(SETTINGS.get("goal.enabled", False))  # [NEW] 스냅샷
+    goal_policy = build_goal_policy(SETTINGS())
+    # ★ 스냅샷 제거: 아래 1-B, 1-C에서 즉시반영 방식으로 전환
 
     # [ADD] OCR 확정샘플 파라미터(설정값 적용)
-    _GOAL_CONFIRM_SAMPLES = int(SETTINGS.get("goal.confirm_samples", 3))
-    _GOAL_CONFIRM_WINDOW_MS = int(SETTINGS.get("goal.confirm_window_ms", 1200))
+    _GOAL_CONFIRM_SAMPLES = int(SETTINGS().get("goal.confirm_samples", 3))
+    _GOAL_CONFIRM_WINDOW_MS = int(SETTINGS().get("goal.confirm_window_ms", 1200))
     # ★ 전처리 폴백 스위치(기본 False = raw-only)
-    _USE_PREPROCESS_FALLBACK = bool(SETTINGS.get("ocr.use_preprocess_fallback", False))
+    _USE_PREPROCESS_FALLBACK = bool(SETTINGS().get("ocr.use_preprocess_fallback", False))
 
     # 전역 간격 변수 초기화(초깃값 350 → 설정값으로 덮어씀)
     global _HOME_TPL_PATH, _CACHED_ROI, _SKIP_FILE_ROI_ONCE, _CONFIRM_WINDOW_MS, _AWAIT_ENTER_MS, _AWAIT_SETTLE_MS
@@ -1044,7 +1437,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
     _sync_screen_profile()
 
     # --- [NEW] 초기 autoemail 설정 주입 ---
-    email_cfg = SETTINGS.get("email", {})
+    email_cfg = SETTINGS().get("email", {})
     # 기본값 보정
     email_cfg.setdefault("enabled", False)
     email_cfg.setdefault("provider", "gmail")
@@ -1075,7 +1468,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
     autoemail.configure(email_cfg)
 
     # --- Freeze 감지기 준비 ---
-    freeze = None  # type: Optional[FreezeMonitor]
+    global freeze  # 전역 인스턴스만 사용
     _frz_last_cap_ts = 0.0  # ⬅️ 추가: 마지막 캡처 시각
 
     def _on_freeze_trip(count: int):
@@ -1120,6 +1513,12 @@ def routine_loop(stop_event_global, state_cb, log_cb):
             while not stop_event.is_set() and not stop_event_global.is_set():
                 now = time.time()
 
+                # 예약 종료 스케줄 검사 (저부하 폴링)
+                try:
+                    _SCHED_SD.maybe_check_and_trigger()
+                except Exception:
+                    pass
+
                 # ★ UI 상호작용(창 이동/리사이즈) 중에는 무거운 작업을 잠깐 쉰다
                 try:
                     if _busy_throttle_gate(store):
@@ -1138,6 +1537,9 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                     log_cb("============중지됨============")
                     state_cb("IDLE")
                     break
+                if now - last_run < interval:
+                    time.sleep(0.01)  # interval 대기 중 CPU 스핀 방지
+                    continue
                 if now - last_run >= interval:
                     # ★ 드래그 중엔 루틴 실행 자체를 건너뛰어 클릭/탬플릿매칭 비용 차단
                     try:
@@ -1147,25 +1549,55 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                     except Exception:
                         pass
 
-                    # ★★★ 홈 판정(AWAIT_HOME) 중에는 루틴 실행/새 probe 생성 모두 중단
-                    if probe is not None:
+                    if _SPAM_ACTIVE:
+                        _spam_tick()
+                        # [NEW] 스팸 모드에서도 프리즈 모니터 유지 가동
+                        try:
+                            if freeze is not None and not freeze.is_disabled:
+                                nowf = time.time()
+                                # _frz_last_cap_ts 는 루프 상단에서 0.0으로 초기화해둔 float
+                                # freeze.cfg.interval_sec (freeze_monitor 내부) 간격에 맞춰 샘플링
+                                if (nowf - _frz_last_cap_ts) >= getattr(freeze.cfg, "interval_sec", 60.0):
+                                    fbgr = _capture_frame_bgr_like_gui()  # GUI와 동일 캡처 파이프라인
+                                    freeze.tick(fbgr)
+                                    _frz_last_cap_ts = nowf
+                        except Exception:
+                            pass
+
                         last_run = now
-                        # AWAIT_HOME 상태 유지(정착 대기/프레임 스텝은 아래 AWAIT 분기에서 처리)
                         continue
 
-                    try:
-                        execute_routine(routine_items)
-                    except Exception as e:
-                        log_cb(f"[routine] 예외 흡수: {e!r}")  # 스레드 살리고 다음 사이클 진행
+                    # 목표달성 토글이 런타임에서 OFF로 바뀌었으면 홈 OCR 강제 중단
+                    if not _goal_enabled_now():
+                        if probe is not None:
+                            try:
+                                probe.stop()
+                            except Exception:
+                                pass
+                        probe = None
+                        _WANT_AWAIT_HOME = False
+                        _HOME_OCR_DONE = False
+                        state_cb("RUNNING")
+
+                    # ★★★ 홈 판정(AWAIT_HOME) 중에는 루틴 실행/새 probe 생성 모두 중단
+                    # probe가 없을 때만 루틴 실행 (있으면 아래 probe.step() 분기에서 처리)
+                    if probe is None:
+                        try:
+                            execute_routine(routine_items)
+                        except Exception as e:
+                            log_cb(f"[routine] 예외 흡수: {e!r}")  # 스레드 살리고 다음 사이클 진행
                     last_run = now
 
                     # 결과 트리거 직후 AWAIT_HOME 시작
                     # main.py - 반복 루프 내 probe 생성 지점
-                    if GOAL_ENABLED and GOAL_AVAILABLE and _WANT_AWAIT_HOME:
+                    if _goal_enabled_now() and GOAL_AVAILABLE and _WANT_AWAIT_HOME:
                         if probe is None:
                             _WANT_AWAIT_HOME = False  # ← 소비하고 바로 리셋
+                            # [FIX] 루틴 감지 conf와 home_anchor.json 임계값 중 낮은 값 사용
+                            # → 루틴이 감지한 스코어를 probe가 재확인 못하는 임계값 불일치 방지
+                            _probe_thr = min(load_home_anchor_threshold(), float(_AWAIT_HOME_CONF))
                             probe = HomeProbe(
-                                ncc_threshold=load_home_anchor_threshold(),
+                                ncc_threshold=_probe_thr,
                                 soft_timeout_ms=8000,
                                 hard_timeout_ms=12000
                             )
@@ -1179,12 +1611,12 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                             globals()["_DEBUG_OCR_DUMPED"] = False  # ← 덤프 1회 가드 리셋
                             # --- FREEZE 모니터 시작 ---
                             if freeze is None or freeze.is_disabled:
-                                freeze = FreezeMonitor.from_settings_dict(SETTINGS.get("freeze", None),
+                                freeze = FreezeMonitor.from_settings_dict(SETTINGS().get("freeze", None),
                                                                           on_trip=_on_freeze_trip)
                             freeze.activate()
                             t_trigger_ms = int(time.time() * 1000)
-                    else:
-                        probe = None  # Goal 미사용/불가면 AWAIT_HOME 비활성
+                    elif not _goal_enabled_now() or not GOAL_AVAILABLE:
+                        probe = None  # Goal 비활성/불가 → AWAIT_HOME 강제 해제
 
                 if probe is not None:
                     # ★ 드래그 중이면 캡처/매칭/프리즈틱 자체를 잠깐 쉰다
@@ -1239,8 +1671,17 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                     if res == "hit":
                         if freeze is not None:
-                            freeze.deactivate()
+                            try:
+                                # 홈 진입 순간엔 프리즈 누적 카운터/해시를 초기화하고 샘플링을 끈다.
+                                cnt = getattr(freeze, "_consec", 0)
+                                freeze.reset()  # ← 추가
+                                freeze.deactivate()  # 기존 유지
+                                _log_throttled(log_cb, "FREEZE_RESET", f"[FREEZE] 홈 hit → freeze.reset() 수행 (누적={cnt})",
+                                               60.0)
+                            except Exception:
+                                freeze.deactivate()
                         _home_ff_limiter_reset()
+
                         # ---- 최초 1회 커밋: 파일 캐시가 비어 있으면 방금 매칭한 bbox로 커밋 ----
                         if _CACHED_ROI is None and _HOME_TPL_PATH is not None and _HOME_SCREEN_WH is not None:
                             last_bbox = probe.get_last_bbox() if probe else None
@@ -1263,48 +1704,61 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                             pass
 
                         # ---- 조건부 다중확인(최대 2회 추가) ----
+                        # === BASELINE OCR (hit 프레임 고정) ===
                         samples_ok = []
-                        attempts = 0
                         reached = False
-                        last_valid = None  # [debug] 미달 로그에서 안전하게 참조
+                        metrics = None
 
-                        # 샘플 간 간격(ms) = confirm_window_ms를 (샘플수-1)로 등분 (1회면 0)
-                        _div = max(1, _GOAL_CONFIRM_SAMPLES - 1)
-                        _spacing_ms = int(max(0, _CONFIRM_WINDOW_MS) / _div)
+                        # hit를 판정한 바로 그 frame_bgr로 1회 판독을 고정 수행
+                        m0 = _read_metrics_from_current_home(frame_bgr)
+                        m0 = _coerce_metric_values(m0 or {})
 
-                        while attempts < _GOAL_CONFIRM_SAMPLES:
-                            attempts += 1
-
-                            # 처음 N-1회는 "원본(raw) 경로"로 시도, 마지막 1회만 기존 전처리 경로로 폴백
-                            is_last_try = (attempts == _GOAL_CONFIRM_SAMPLES)
-
-                            # 기본은 항상 '원본' 파이프라인
-                            m = _read_metrics_from_current_home(frame_bgr)
-                            m = _coerce_metric_values(m or {})
-
-                            # 정책 판단/조기종료 로직(기존 그대로)
-                            if m.get("rank_flag") == "OUT_OF_RANGE":
-                                metrics = m
-                                reached = goal_policy.on_sample(m)
-                                break
-
-                            sane = _is_sane_metrics(m)
-                            if sane:
-                                samples_ok.append(m)
-                                ok = goal_policy.on_sample(m)
-                                if not ok:
-                                    ok = _is_goal_met_by_settings(m)  # ← 로컬 가드: settings 프리셋 직접 판정
-                                if ok:
+                        # 정책 판단/조기종료 동일 처리
+                        if m0.get("rank_flag") == "OUT_OF_RANGE":
+                            metrics = m0
+                            reached = goal_policy.on_sample(m0)
+                        else:
+                            sane0 = _is_sane_metrics(m0)
+                            if sane0:
+                                samples_ok.append(m0)
+                                ok0 = goal_policy.on_sample(m0)
+                                if not ok0:
+                                    ok0 = _is_goal_met_by_settings(m0)
+                                if ok0:
                                     reached = True
+                                    metrics = m0
+
+                        # === 추가 샘플이 필요할 때만 루프 수행 ===
+                        attempts = 1  # m0를 첫 샘플로 이미 사용
+                        if not reached:
+                            _div = max(1, _GOAL_CONFIRM_SAMPLES - 1)
+                            _spacing_ms = int(max(0, _CONFIRM_WINDOW_MS) / _div)
+
+                            while attempts < _GOAL_CONFIRM_SAMPLES:
+                                attempts += 1
+                                is_last_try = (attempts == _GOAL_CONFIRM_SAMPLES)
+
+                                # [FIX] 매 재시도마다 새 프레임 캡처 (기존: 첫 재시도가 m0와 동일 프레임)
+                                time.sleep(max(0, _spacing_ms) / 1000.0)
+                                frame_bgr = _capture_frame_bgr_like_gui()
+                                m = _read_metrics_from_current_home(frame_bgr)
+                                m = _coerce_metric_values(m or {})
+
+                                if m.get("rank_flag") == "OUT_OF_RANGE":
                                     metrics = m
+                                    reached = goal_policy.on_sample(m)
                                     break
 
-                            # 다음 샷 대기 및 최신 프레임
-                            if attempts < _GOAL_CONFIRM_SAMPLES:
-                                _div = max(1, _GOAL_CONFIRM_SAMPLES - 1)
-                                _spacing_ms = int(max(0, _CONFIRM_WINDOW_MS) / _div)
-                                time.sleep(max(0, _spacing_ms) / 1000.0)
-                                frame_bgr = _capture_frame_bgr_like_gui()  # GUI와 동일 파이프라인
+                                sane = _is_sane_metrics(m)
+                                if sane:
+                                    samples_ok.append(m)
+                                    ok = goal_policy.on_sample(m)
+                                    if not ok:
+                                        ok = _is_goal_met_by_settings(m)
+                                    if ok:
+                                        reached = True
+                                        metrics = m
+                                        break
 
                         # 샘플 후처리: 확정 못했지만 유효 샘플이 있다면 융합해서 한 번 더 판단
                         if not reached and samples_ok:
@@ -1317,7 +1771,6 @@ def routine_loop(stop_event_global, state_cb, log_cb):
 
                         # [DEBUG] 미달 요약 로그
                         if not reached:
-                            # fused/last_valid/OUT_OF_RANGE 등의 상황을 최대한 정보화
                             try:
                                 def _fmt_line(m: dict) -> str:
                                     if m.get("rank_flag") == "OUT_OF_RANGE":
@@ -1332,8 +1785,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                                 if 'metrics' in locals() and metrics is not None:
                                     line = _fmt_line(metrics)
                                     log_cb(f"[목표미달] {line}")
-                                elif ('last_valid' in locals()) and (last_valid is not None):
-                                    line = _fmt_line(last_valid)
+                                elif ('samples_ok' in locals()) and samples_ok:
+                                    line = _fmt_line(samples_ok[-1])  # 최근 유효 샘플로 대체
                                     log_cb(f"[목표미달] {line}")
                                 else:
                                     log_cb("[목표미달] valid OCR sample 없음")
@@ -1664,6 +2117,10 @@ def _match_home_anchor(frame_bgr, _roi_ignored):
         if _SKIP_FILE_ROI_ONCE:
             _SKIP_FILE_ROI_ONCE = False
 
+    # src가 tpl보다 작으면 matchTemplate 단언 실패 → 캐시 무효화 후 풀프레임으로 폴백
+    if src.shape[0] < tpl.shape[0] or src.shape[1] < tpl.shape[1]:
+        _CACHED_ROI = None
+        src = frame_bgr
     res = cv2.matchTemplate(src, tpl, cv2.TM_CCOEFF_NORMED)
     _, maxVal, _, maxLoc = cv2.minMaxLoc(res)
 

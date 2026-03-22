@@ -16,6 +16,7 @@ class FreezeConfig:
     tol_ahash: int = 2           # aHash 허용 해밍거리
     tol_dhash: int = 2           # dHash 허용 해밍거리
     cooldown_sec: int = 0        # 트립 후 재활성 대기(0=영구 비활성)
+    warmup_sec: int = 120  # 활성/리셋 후 워밍업(초) ← 추가
 
     @staticmethod
     def _coerce_int(val, default: int) -> int:
@@ -33,10 +34,11 @@ class FreezeConfig:
         if not isinstance(d, dict):
             return cls()
         interval = cls._coerce_int(d.get("interval_sec", 60), 60)
-        consec   = cls._coerce_int(d.get("consecutive", 12), 12)
-        tol_a    = cls._coerce_int(d.get("tol_ahash", 2), 2)
-        tol_d    = cls._coerce_int(d.get("tol_dhash", 2), 2)
-        cd       = cls._coerce_int(d.get("cooldown_sec", 0), 0)
+        consec = cls._coerce_int(d.get("consecutive", 25), 25)
+        tol_a = cls._coerce_int(d.get("tol_ahash", 2), 2)
+        tol_d = cls._coerce_int(d.get("tol_dhash", 2), 2)
+        cd = cls._coerce_int(d.get("cooldown_sec", 600), 600)
+        wu = cls._coerce_int(d.get("warmup_sec", 120), 120)
 
         # 안정 범위 클램프
         interval = cls._clamp(interval, 10, 300)   # 10s ~ 5m
@@ -44,9 +46,10 @@ class FreezeConfig:
         tol_a    = cls._clamp(tol_a,    0, 8)
         tol_d    = cls._clamp(tol_d,    0, 8)
         cd       = max(0, cd)
+        wu = cls._clamp(wu, 0, 600)  # 워밍업 0~600초
 
         return cls(interval_sec=interval, consecutive=consec,
-                   tol_ahash=tol_a, tol_dhash=tol_d, cooldown_sec=cd)
+                   tol_ahash=tol_a, tol_dhash=tol_d, cooldown_sec=cd, warmup_sec=wu)
 
 
 def _ahash(img_bgr: np.ndarray) -> int:
@@ -99,6 +102,8 @@ class FreezeMonitor:
         self._last_ah: Optional[int] = None
         self._last_dh: Optional[int] = None
         self._consec: int = 0  # 현재 누적 카운트
+        # --- 워밍업/쿨다운 ---
+        self._warmup_until_ts: float = 0.0  # activate/reset 이후 120s
 
     # ---------- 설정 파서(외부 JSON → 안전한 런타임 파라미터) ----------
     @staticmethod
@@ -112,19 +117,29 @@ class FreezeMonitor:
 
     # ---------- 수명 제어 ----------
     def activate(self) -> None:
-        """샘플링 활성화(단, 쿨다운 중이면 즉시 off 유지)."""
+        # 쿨다운 만료 확인
         if self.is_disabled and self.cfg.cooldown_sec > 0:
             if time.time() >= self._disabled_until_ts:
-                # 쿨다운 종료 → 재활성 허용
                 self.is_disabled = False
         if not self.is_disabled:
             self._active = True
-            # 첫 샘플 간격 보장 위해 타임스탬프 조정
             self._last_sample_ts = 0.0
+            # 활성화 직후 워밍업 120s
+            self._warmup_until_ts = time.time() + float(getattr(self.cfg, "warmup_sec", 120))
 
     def deactivate(self) -> None:
-        """샘플링 비활성화(상태만 내림)."""
         self._active = False
+
+    def reset(self) -> None:
+        """
+        누적 카운트·직전 해시·샘플 타임스탬프를 초기화하고
+        워밍업(120s)을 다시 시작한다. 활성/비활성 상태는 유지.
+        """
+        self._last_sample_ts = 0.0
+        self._last_ah = None
+        self._last_dh = None
+        self._consec = 0
+        self._warmup_until_ts = time.time() + float(getattr(self.cfg, "warmup_sec", 120))
 
     # ---------- 핵심 로직 ----------
     def tick(self, frame_bgr: np.ndarray) -> Optional[int]:
@@ -138,50 +153,43 @@ class FreezeMonitor:
         if not self._active or self.is_disabled:
             return None
 
-        t = time.time()
-        if t - self._last_sample_ts < self.cfg.interval_sec:
-            return None  # 아직 샘플 주기 아님
+        now = time.time()
+        # interval 보장
+        if (now - self._last_sample_ts) < max(1, int(self.cfg.interval_sec)):
+            return None
+        self._last_sample_ts = now
 
-        self._last_sample_ts = t
+        # 해시 계산
+        ah = _ahash(frame_bgr)
+        dh = _dhash(frame_bgr)
 
-        try:
-            ah = _ahash(frame_bgr)
-            dh = _dhash(frame_bgr)
-        except Exception:
-            # 이미지 변환 실패 등 → 카운트 리셋
-            self._last_ah = ah = None
-            self._last_dh = dh = None
+        # 첫 샘플/워밍업: 상태 갱신만, 누적 카운트 증가 금지
+        if self._last_ah is None or self._last_dh is None or now < self._warmup_until_ts:
+            self._last_ah, self._last_dh = ah, dh
             self._consec = 0
             return 0
 
-        if self._last_ah is None or self._last_dh is None:
-            # 첫 샘플
-            self._last_ah, self._last_dh = ah, dh
-            self._consec = 1
-            return self._consec
-
-        dist_a = _hamming64(self._last_ah, ah)
-        dist_d = _hamming64(self._last_dh, dh)
-
-        if dist_a <= self.cfg.tol_ahash and dist_d <= self.cfg.tol_dhash:
-            self._consec += 1
-        else:
-            self._consec = 1  # 다른 프레임으로 판정 → 카운트 리셋(자기 자신 포함)
-
-        # 마지막 해시 갱신
+        # 허용 해밍거리 내 → 동일 프레임으로 누적
+        ha = _hamming64(ah, self._last_ah)
+        hd = _hamming64(dh, self._last_dh)
         self._last_ah, self._last_dh = ah, dh
 
-        if self._consec >= self.cfg.consecutive:
-            # 트립
+        if ha <= int(self.cfg.tol_ahash) and hd <= int(self.cfg.tol_dhash):
+            self._consec += 1
+        else:
+            self._consec = 0
+
+        # 트립 판정
+        if self._consec >= int(self.cfg.consecutive):
+            # 1회 트립 콜백
+            try:
+                if self.on_trip: self.on_trip(self._consec)
+            except Exception:
+                pass
             self._active = False
-            self.is_disabled = True
-            if self.cfg.cooldown_sec > 0:
-                self._disabled_until_ts = time.time() + self.cfg.cooldown_sec
-            if self.on_trip:
-                try:
-                    self.on_trip(self._consec)
-                except Exception:
-                    pass
+            if int(self.cfg.cooldown_sec) > 0:
+                self.is_disabled = True
+                self._disabled_until_ts = now + int(self.cfg.cooldown_sec)
             return self._consec
 
         return self._consec
