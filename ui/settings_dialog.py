@@ -1,8 +1,11 @@
 # ui/settings_dialog.py
 from __future__ import annotations
 import threading
+import webbrowser
 import customtkinter as ctk
 from tkinter import messagebox
+from version import APP_VERSION
+from core import updater as _updater
 import autoemail
 from path_manager import BASE_DIR, get_img_path  # ← 추가
 from PIL import Image, ImageEnhance
@@ -238,6 +241,8 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkButton(self.tabbar, text="예약 종료", command=self._show_schedule_tab).pack(fill="x", pady=(0, 6))
         # [ADD] 스팸 모드 탭
         ctk.CTkButton(self.tabbar, text="스팸 모드", command=self._show_spam_tab).pack(fill="x", pady=(0, 6))
+        # [ADD] 업데이트 탭
+        ctk.CTkButton(self.tabbar, text="업데이트", command=self._show_update_tab).pack(fill="x", pady=(0, 6))
 
         # ─ 페이지들 ─
         self.page_email = ctk.CTkFrame(self.content)
@@ -250,6 +255,9 @@ class SettingsDialog(ctk.CTkToplevel):
         # [ADD] 스팸 모드 페이지
         self.page_spam = ctk.CTkFrame(self.content)
         self.page_spam.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # [ADD] 업데이트 페이지
+        self.page_update = ctk.CTkFrame(self.content)
+        self.page_update.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         # 스팸 탭에서 쓸 이미지 리스트 선로딩
         self._ensure_spam_choices_loaded()  # 없으면 새로 추가될 함수
@@ -261,6 +269,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._build_schedule_page(self.page_schedule)
         # [ADD] 스팸 모드 빌드
         self._build_spam_page(self.page_spam)
+        # [ADD] 업데이트 탭 빌드
+        self._build_update_page(self.page_update)
 
         # (안전) 초기 프리뷰 동기화
         try:
@@ -2689,10 +2699,19 @@ class SettingsDialog(ctk.CTkToplevel):
             except Exception:
                 pass
 
+    def _show_update_tab(self):
+        try:
+            self._lift_page(self.page_update)
+        except Exception:
+            try:
+                self.page_update.lift()
+            except Exception:
+                pass
+
     def _lift_page(self, target):
         # content 아래에 얹힌 모든 page_*를 한 번에 관리
         pages = []
-        for name in ("page_email", "page_perf", "page_schedule", "page_spam"):
+        for name in ("page_email", "page_perf", "page_schedule", "page_spam", "page_update"):
             pg = getattr(self, name, None)
             if pg is not None:
                 pages.append(pg)
@@ -2702,5 +2721,205 @@ class SettingsDialog(ctk.CTkToplevel):
             for p in pages:
                 if p is not target:
                     p.lower()
+        except Exception:
+            pass
+
+    # ───────────────────────────────────────────────────────────────
+    # 업데이트 탭
+    # ───────────────────────────────────────────────────────────────
+
+    def _build_update_page(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+
+        pad = {"padx": 24, "pady": 6}
+
+        # 현재 버전
+        ctk.CTkLabel(
+            parent,
+            text="업데이트",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 4))
+
+        ctk.CTkLabel(
+            parent,
+            text=f"현재 버전:  v{APP_VERSION}",
+            text_color="gray",
+        ).grid(row=1, column=0, sticky="w", **pad)
+
+        # 상태 표시 라벨
+        self._upd_status_lbl = ctk.CTkLabel(parent, text="", text_color="gray")
+        self._upd_status_lbl.grid(row=2, column=0, sticky="w", **pad)
+
+        # 최신 버전 라벨 (체크 후 채워짐)
+        self._upd_latest_lbl = ctk.CTkLabel(parent, text="")
+        self._upd_latest_lbl.grid(row=3, column=0, sticky="w", **pad)
+
+        # 변경사항 박스
+        self._upd_body_box = ctk.CTkTextbox(parent, height=120, state="disabled", wrap="word")
+        self._upd_body_box.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 8))
+
+        # 진행 바 (숨겨둠)
+        self._upd_progress = ctk.CTkProgressBar(parent)
+        self._upd_progress.set(0)
+        self._upd_progress_lbl = ctk.CTkLabel(parent, text="", text_color="gray", font=ctk.CTkFont(size=11))
+
+        # 버튼 행
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_frame.grid(row=7, column=0, sticky="w", padx=24, pady=(4, 0))
+
+        self._upd_check_btn = ctk.CTkButton(
+            btn_frame, text="업데이트 확인",
+            command=self._upd_check_now,
+        )
+        self._upd_check_btn.pack(side="left")
+
+        self._upd_open_btn = ctk.CTkButton(
+            btn_frame, text="릴리즈 페이지",
+            fg_color="transparent", border_width=1,
+            command=lambda: webbrowser.open(_updater.RELEASES_URL),
+        )
+        self._upd_open_btn.pack(side="left", padx=(8, 0))
+
+        self._upd_dl_btn = ctk.CTkButton(
+            btn_frame, text="지금 업데이트",
+            fg_color="#2563eb",
+            command=self._upd_start_download,
+        )
+        # 처음엔 숨김 — 새 버전이 있을 때만 표시
+
+        self._upd_release_info: dict | None = None
+        self._upd_downloading = False
+
+    def _upd_check_now(self):
+        """업데이트 확인 버튼 핸들러 — 백그라운드 스레드에서 API 호출."""
+        self._upd_check_btn.configure(state="disabled", text="확인 중...")
+        self._upd_status_lbl.configure(text="GitHub에서 버전 정보를 가져오는 중...", text_color="gray")
+        self._upd_latest_lbl.configure(text="")
+        self._upd_body_box.configure(state="normal")
+        self._upd_body_box.delete("1.0", "end")
+        self._upd_body_box.configure(state="disabled")
+        try:
+            self._upd_dl_btn.pack_forget()
+        except Exception:
+            pass
+
+        def _run():
+            info = _updater.check_latest_release()
+            self.after(0, lambda: self._upd_on_result(info))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _upd_on_result(self, info: dict | None):
+        self._upd_check_btn.configure(state="normal", text="업데이트 확인")
+        if info is None:
+            self._upd_status_lbl.configure(
+                text="버전 정보를 가져오지 못했습니다. (네트워크 확인)", text_color="#f87171",
+            )
+            return
+
+        self._upd_release_info = info
+        tag = info.get("tag_name", "")
+        body = (info.get("body") or "").strip()
+        exe_asset = info.get("exe_asset")
+
+        if _updater.is_newer(tag):
+            self._upd_status_lbl.configure(text="새 버전이 있습니다!", text_color="#4ade80")
+            self._upd_latest_lbl.configure(text=f"최신 버전:  {tag}", text_color="#4ade80")
+            if exe_asset:
+                self._upd_dl_btn.pack(side="left", padx=(8, 0))
+        else:
+            self._upd_status_lbl.configure(text="최신 버전을 사용 중입니다.", text_color="#4ade80")
+            self._upd_latest_lbl.configure(text=f"최신 버전:  {tag}", text_color="gray")
+
+        if body:
+            self._upd_body_box.configure(state="normal")
+            self._upd_body_box.delete("1.0", "end")
+            self._upd_body_box.insert("1.0", body)
+            self._upd_body_box.configure(state="disabled")
+
+    def _upd_start_download(self):
+        if self._upd_downloading or self._upd_release_info is None:
+            return
+        exe_asset = self._upd_release_info.get("exe_asset")
+        if not exe_asset:
+            return
+
+        from path_manager import BASE_DIR
+        dest = BASE_DIR / exe_asset["name"]
+
+        self._upd_downloading = True
+        self._upd_dl_btn.configure(state="disabled", text="다운로드 중...")
+        self._upd_check_btn.configure(state="disabled")
+
+        # 진행 바 표시
+        self._upd_progress.grid(row=5, column=0, sticky="ew", padx=24, pady=(0, 2))
+        self._upd_progress_lbl.grid(row=6, column=0, sticky="w", padx=24)
+
+        def _run():
+            try:
+                _updater.download_exe(
+                    exe_asset["url"],
+                    dest,
+                    progress_cb=self._upd_on_progress,
+                )
+                self.after(0, self._upd_on_download_done)
+            except Exception as e:
+                self.after(0, lambda: self._upd_on_download_error(str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _upd_on_progress(self, done: int, total: int):
+        if total > 0:
+            ratio = done / total
+            label = f"{done/1_048_576:.1f} / {total/1_048_576:.1f} MB"
+        else:
+            ratio = 0
+            label = f"{done/1_048_576:.1f} MB"
+        self.after(0, lambda r=ratio, l=label: self._upd_progress_ui(r, l))
+
+    def _upd_progress_ui(self, ratio: float, label: str):
+        try:
+            self._upd_progress.set(ratio)
+            self._upd_progress_lbl.configure(text=label)
+        except Exception:
+            pass
+
+    def _upd_on_download_done(self):
+        try:
+            self._upd_progress.set(1.0)
+            self._upd_progress_lbl.configure(text="다운로드 완료!")
+            self._upd_dl_btn.configure(
+                state="normal", text="재시작하여 업데이트 적용",
+                fg_color="#16a34a",
+                command=self._upd_apply,
+            )
+            self._upd_check_btn.configure(state="normal")
+            self._upd_downloading = False
+        except Exception:
+            pass
+
+    def _upd_apply(self):
+        if self._upd_release_info is None:
+            return
+        exe_asset = self._upd_release_info.get("exe_asset")
+        if not exe_asset:
+            return
+        from path_manager import BASE_DIR
+        dest = BASE_DIR / exe_asset["name"]
+        try:
+            _updater.apply_update(dest)
+        except RuntimeError as e:
+            messagebox.showinfo(
+                "안내",
+                f"{e}\n\n다운로드된 파일:\n{dest}\n\n현재 exe와 수동으로 교체해 주세요.",
+                parent=self,
+            )
+
+    def _upd_on_download_error(self, msg: str):
+        try:
+            self._upd_downloading = False
+            self._upd_dl_btn.configure(state="normal", text="다시 시도", fg_color="#2563eb")
+            self._upd_check_btn.configure(state="normal")
+            self._upd_progress_lbl.configure(text=f"오류: {msg}", text_color="#f87171")
         except Exception:
             pass
