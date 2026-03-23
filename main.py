@@ -1354,18 +1354,82 @@ def _read_metrics_from_current_home(frame_bgr):
 '''
 
 
-# debug 시작
 def _read_metrics_from_current_home(frame_bgr):
     """
-    GUI의 OCR 테스트(_open_verify)와 동일 파이프라인으로 읽는다.
-    - 프리뷰 폭 한계(최대 1200, 또는 화면폭-120 중 작은 값)로 다운스케일
-    - 저장 당시 스크린 크기(ocr.screen.w/h) → 현재 프리뷰 크기로 ROI 스케일
-    - 같은 다운스케일 프레임에 대해 OCR 엔진 폴백 체인을 실행
+    GUI 테스트(_open_verify → _run_calib_ocr_and_render → _ocr_digits_with_fallback)와
+    완전히 동일한 파이프라인으로 등수/점수를 읽는다.
+
+    테스트 경로:
+      1) 풀해상도 캡처 → 다운스케일(최대 1200px)
+      2) ROI를 다운스케일 프레임 기준으로 스케일 → 크롭
+      3) read_rank_out_of_range_ko → read_text → read_digits 순서로 OCR
+      4) 첫 번째 숫자 그룹만 사용(_parse_first_int)
+
+    루틴도 이 순서를 그대로 따른다.
     """
-    # 이 함수는 core.roi_from_settings.run_home_ocr_like_gui()가
-    # 위 3단계를 모두 내부에서 수행하도록 통일돼 있다.
-    return run_home_ocr_like_gui(frame_bgr, SETTINGS())
-# debug 끝
+    from core import ocr as _ocr
+    from core.roi_from_settings import read_rois_xywh_from_settings, scale_xywh_from_base
+    from PIL import Image as _Image
+
+    # 1) 다운스케일 (테스트와 동일)
+    bgr_scaled, _ = _downscale_like_gui(frame_bgr)
+    h_s, w_s = bgr_scaled.shape[:2]
+
+    # 2) ROI 읽기 및 현재 프레임 크기로 스케일
+    rois_xywh, base = read_rois_xywh_from_settings(SETTINGS())
+    if not rois_xywh:
+        return {}
+
+    def _crop_pil(key):
+        xywh = scale_xywh_from_base(rois_xywh.get(key), base, (w_s, h_s))
+        if not xywh:
+            return None
+        x, y, cw, ch = xywh
+        x = max(0, x - 2); y = max(0, y - 2)
+        x2 = min(w_s, x + cw + 4); y2 = min(h_s, y + ch + 4)
+        if x2 <= x or y2 <= y:
+            return None
+        crop_bgr = bgr_scaled[y:y2, x:x2]
+        return _Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+
+    def _first_int(s):
+        m = re.search(r"\d+", s or "")
+        return int(m.group(0)) if m else None
+
+    rank_pil = _crop_pil("roi_rank")
+    pts_pil  = _crop_pil("roi_points")
+    result   = {}
+
+    # 3) 등수 OCR
+    if rank_pil is not None:
+        # (0) 순위권 이탈 전용 탐지
+        # - 컨투어 게이트가 "숫자"로 판정하면 Tesseract 호출 없이 "" 즉시 반환 (빠름)
+        # - "한글"로 판정하면 내부에서 5회 Tesseract 패스로 완전 확인
+        # → 어느 경우든 read_text를 추가로 호출할 필요 없음 (Tesseract 1회 절약)
+        oor_fn = getattr(_ocr, "read_rank_out_of_range_ko", None)
+        if callable(oor_fn):
+            raw_rr = str(oor_fn(rank_pil) or "")
+            if raw_rr:
+                result["rank_flag"] = "OUT_OF_RANGE"
+
+        # (1) 숫자 읽기
+        if "rank_flag" not in result:
+            rd = getattr(_ocr, "read_digits", None)
+            if callable(rd):
+                v = _first_int(str(rd(rank_pil) or ""))
+                if isinstance(v, int):
+                    result["rank"] = v
+                    result["rank_flag"] = "NUMERIC"
+
+    # 4) 점수 OCR
+    if pts_pil is not None:
+        rd = getattr(_ocr, "read_digits", None)
+        if callable(rd):
+            v = _first_int(str(rd(pts_pil) or ""))
+            if isinstance(v, int):
+                result["points"] = v
+
+    return result
 
 
 def _is_goal_met_by_settings(m: dict) -> bool:
@@ -1695,21 +1759,14 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         # OCR 중 UI 잠금
                         get_state_store().set_ocr_sampling_active(True)
 
-                        # [ADD] GUI withdraw/알파트래커 정지 반영될 때까지 짧게 대기
-                        # 폴러 주기(≈200ms) + 컴포지터 반영 여유
-                        try:
-                            _wait_gui_hidden_for_ocr(max_wait_ms=450)
-                        except Exception:
-                            # 대기 실패는 치명 아님 → 무시하고 진행
-                            pass
-
                         # ---- 조건부 다중확인(최대 2회 추가) ----
                         # === BASELINE OCR (hit 프레임 고정) ===
+                        # m0는 프로브 hit 시점의 frame_bgr를 재사용하므로
+                        # GUI withdrawal 대기 없이 즉시 처리 가능 (GUI가 ROI를 가리지 않음)
                         samples_ok = []
                         reached = False
                         metrics = None
 
-                        # hit를 판정한 바로 그 frame_bgr로 1회 판독을 고정 수행
                         m0 = _read_metrics_from_current_home(frame_bgr)
                         m0 = _coerce_metric_values(m0 or {})
 
@@ -1731,6 +1788,12 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         # === 추가 샘플이 필요할 때만 루프 수행 ===
                         attempts = 1  # m0를 첫 샘플로 이미 사용
                         if not reached:
+                            # 추가 샘플은 새 프레임을 캡처하므로 GUI가 화면에서 사라진 뒤여야 함
+                            # m0 OCR 소요 시간 동안 GUI가 이미 철수 중 → 남은 시간만 보충 대기
+                            try:
+                                _wait_gui_hidden_for_ocr(max_wait_ms=450)
+                            except Exception:
+                                pass
                             _div = max(1, _GOAL_CONFIRM_SAMPLES - 1)
                             _spacing_ms = int(max(0, _CONFIRM_WINDOW_MS) / _div)
 

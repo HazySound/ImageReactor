@@ -104,7 +104,11 @@ class OverlayApp(ctk.CTk):
         self._ensure_tesseract_path(silent=True)
 
         # 윈도우
-        self.title("ImageReactor")
+        try:
+            from version import APP_VERSION
+            self.title(f"ImageReactor v{APP_VERSION}")
+        except Exception:
+            self.title("ImageReactor")
         self.attributes("-topmost", True)
         self.geometry("640x400")
         self.minsize(640, 360)
@@ -195,6 +199,9 @@ class OverlayApp(ctk.CTk):
         self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
         self._log_gui(f"해상도 : {self.winfo_screenwidth()} X {self.winfo_screenheight()}")
 
+        # 시작 3초 후 백그라운드에서 업데이트 체크
+        self.after(3000, self._check_update_bg)
+
         geo = self.settings.get("gui._last_geometry")
         if geo:
             try:
@@ -271,6 +278,29 @@ class OverlayApp(ctk.CTk):
             self.after(0, lambda: self._ensure_win32_hooks(want_install))
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # 업데이트 체크
+    # ------------------------------------------------------------------
+    def _check_update_bg(self):
+        """백그라운드 스레드에서 업데이트 체크 후, 새 버전이 있으면 다이얼로그 표시."""
+        import threading
+        from core import updater as _upd
+
+        def _run():
+            info = _upd.check_latest_release()
+            if info and _upd.is_newer(info.get("tag_name", "")):
+                self.after(0, lambda: self._show_update_dialog(info))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_update_dialog(self, release_info: dict):
+        try:
+            from ui.update_dialog import UpdateDialog
+            dlg = UpdateDialog(self, release_info)
+            dlg.focus()
+        except Exception as e:
+            print(f"[updater] 다이얼로그 표시 실패: {e}")
 
     # ------------------------------------------------------------------
     # UI
