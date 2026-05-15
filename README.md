@@ -3,7 +3,7 @@
 
 <div align="center">
 
-[![Download ImageReactor V2](https://img.shields.io/badge/⬇️_DOWNLOAD-ImageReactor_V2_메인_패키지-2563eb?style=for-the-badge)](https://github.com/HazySound/ImageReactor/releases/tag/v2.0.0)
+[![Download ImageReactor V2](https://img.shields.io/badge/⬇️_DOWNLOAD-ImageReactor_V2_메인_패키지-2563eb?style=for-the-badge)](https://github.com/HazySound/ImageReactor/releases/download/v2.0.0/ImageReactor_Release_V2.zip)
 
 ### 🔰 처음 사용하시나요? → 위 버튼으로 **V2 메인 패키지**를 먼저 받으세요
 
