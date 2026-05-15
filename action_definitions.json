@@ -1,5 +1,9 @@
 [
   {
+    "label": "Home",
+    "value": "Home"
+  },
+  {
     "label": "click",
     "value": "click"
   },
@@ -18,5 +22,13 @@
   {
     "label": "Client",
     "value": "Client"
+  },
+  {
+    "label": "F3",
+    "value": "F3"
+  },
+  {
+    "label": "Ctrl+Z",
+    "value": "Ctrl+Z"
   }
 ]

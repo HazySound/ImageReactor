@@ -34,7 +34,8 @@ class HomeProbe:
                  coarse_scale: float = 0.5,
                  coarse_max_runs: int = 2,
                  soft_timeout_ms: int = 8000,
-                 hard_timeout_ms: int = 12000):
+                 hard_timeout_ms: int = 12000,
+                 force_first_hit: bool = False):
         self.ncc_threshold = ncc_threshold
         self.debounce_frames = debounce_frames
         self.settle_ms = settle_ms
@@ -47,6 +48,9 @@ class HomeProbe:
         self.coarse_max_runs = coarse_max_runs
         self.soft_timeout_ms = soft_timeout_ms
         self.hard_timeout_ms = hard_timeout_ms
+        # routine 매칭이 이미 home anchor 를 hit 한 경우 — 첫 step 을 무조건 hit 로 처리.
+        # probe 의 임계값/캐시/타임아웃 단계를 모두 우회한다.
+        self.force_first_hit = bool(force_first_hit)
 
         # 내부 상태
         self._start_ts: Optional[int] = None
@@ -83,6 +87,13 @@ class HomeProbe:
         now = now_ms or _now_ms()
         if self._start_ts is None:
             self.start(now)
+
+        # fast track: routine 단계에서 이미 home anchor 가 hit 됐다.
+        # 매칭/타임아웃/ROI 단계 모두 건너뛰고 즉시 hit 반환.
+        if self.force_first_hit:
+            self.force_first_hit = False
+            self._done = True
+            return "hit"
 
         elapsed = now - self._start_ts
 

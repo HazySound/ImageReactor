@@ -28,6 +28,13 @@ def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def get_resource_path(rel_path: str) -> str:
+    """읽기 전용 리소스 경로. PyInstaller --onefile에선 _MEIPASS, 개발 환경에선 BASE_DIR."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return str(Path(sys._MEIPASS) / rel_path)
+    return str(BASE_DIR / rel_path)
+
+
 width, height = pgi.size()
 
 
