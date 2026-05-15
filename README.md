@@ -1,6 +1,20 @@
 # 🌟 ImageReactor  
 이미지 기반 자동 입력 & 자동화 도구  
 
+<div align="center">
+
+[![Download ImageReactor V2](https://img.shields.io/badge/⬇️_DOWNLOAD-ImageReactor_V2_메인_패키지-2563eb?style=for-the-badge)](https://github.com/HazySound/ImageReactor/releases/tag/v2.0.0)
+
+### 🔰 처음 사용하시나요? → 위 버튼으로 **V2 메인 패키지**를 먼저 받으세요
+
+이후 버전 업데이트는 **프로그램 내 자동 업데이트** 기능으로 진행됩니다.  
+릴리즈 목록 최상단의 단일 `.exe` 파일은 **자동 업데이트 전용**이므로,  
+처음 설치하시는 분은 반드시 위 V2 메인 패키지를 받아야 정상 동작합니다.
+
+</div>
+
+---
+
 > ⚠️ **주의사항**  
 > 본 프로그램은 **범용 이미지 자동화 툴**이며, 특정 게임/프로그램에 대한 구체적인 사용법은 제공하지 않습니다.  
 > 외부에서 작성된 비공식 매뉴얼이 있을 수 있으나, **이를 따라함으로써 발생하는 모든 책임은 전적으로 사용자 본인에게 있습니다.**

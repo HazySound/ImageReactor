@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(wc -l /d/박시몬/ImageReactor/ImageReactor/*.py /d/박시몬/ImageReactor/ImageReactor/core/*.py /d/박시몬/ImageReactor/ImageReactor/ui/*.py)",
+      "Bash(python3:*)",
+      "Bash(python -c \"from version import APP_VERSION, GITHUB_REPO; print\\(APP_VERSION, GITHUB_REPO\\)\")",
+      "Bash(python -c \"from core.updater import check_latest_release, is_newer; print\\(''import OK''\\)\")",
+      "Bash(python -c \"from ui.update_dialog import UpdateDialog; print\\(''import OK''\\)\")",
+      "Bash(venvScriptspython -c \"from core.updater import check_latest_release, is_newer; from ui.update_dialog import UpdateDialog; print\\(''all imports OK''\\)\")",
+      "Bash(\"venv/Scripts/python.exe\" -c \"from core.updater import check_latest_release, is_newer; from ui.update_dialog import UpdateDialog; print\\(''all imports OK''\\)\")",
+      "Bash(\"venv/Scripts/python.exe\" -c \"from ui.settings_dialog import SettingsDialog; print\\(''settings_dialog import OK''\\)\")",
+      "Bash(\"venv/Scripts/python.exe\" -c \":*)",
+      "Bash(python *)",
+      "Bash(venv/Scripts/python.exe *)",
+      "Bash(cat C:\\\\\\\\Users\\\\\\\\cemig\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\D------ImageReactor-ImageReactor\\\\\\\\bea50ea1-7922-4239-bf58-7c03ba5b9d35\\\\\\\\tasks\\\\\\\\biihd5o3g.output)",
+      "Bash(tasklist)",
+      "Bash(taskkill /F /IM python.exe)",
+      "PowerShell(Get-Process *)"
+    ]
+  }
+}

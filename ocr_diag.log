@@ -1,0 +1,18 @@
+2026-05-15 01:44:28.443 | [Timing] === 반복 시작 (ts=1778777068443) ===
+2026-05-15 01:44:31.589 | [Timing] probe created force_first_hit=True settle_ms=250 loop_interval_s=0.45
+2026-05-15 01:44:34.838 | [Timing] probe.step first call: res=hit elapsed_from_await_enter=3250ms settle_done_at=2977ms settle_reason=gui_ready capture_ms=273ms
+2026-05-15 01:44:38.224 | [OCRv2] champ=3011ms(cache=Y) pts:single=4310(conf=66,4d,raw='4310')→4310 anchor=AnchorValue(value=4313, timestamp_ms=1778769477125)/OK rank:single(conf=81,3d,raw='814')→814 (135+23ms)
+2026-05-15 01:44:38.226 | [Timing] start→await=3145ms await→home_hit=3253ms home_hit→ocr_start=0ms ocr=3385ms total=9783ms
+2026-05-15 01:44:38.227 | [목표미달] 점수: 4310점 | 등수: 814등
+2026-05-15 01:44:57.006 | [Timing] === 반복 시작 (ts=1778777097006) ===
+2026-05-15 01:44:57.295 | [Timing] probe created force_first_hit=True settle_ms=250 loop_interval_s=0.45
+2026-05-15 01:45:00.137 | [Timing] probe.step first call: res=hit elapsed_from_await_enter=2842ms settle_done_at=2673ms settle_reason=gui_ready capture_ms=169ms
+2026-05-15 01:45:00.990 | [OCRv2] champ=743ms(cache=Y) pts:single=4310(conf=66,4d,raw='4310')→4310 anchor=AnchorValue(value=4310, timestamp_ms=1778777078198)/OK rank:single(conf=86,3d,raw='813')→813 (18+11ms)
+2026-05-15 01:45:00.992 | [Timing] start→await=289ms await→home_hit=2844ms home_hit→ocr_start=0ms ocr=853ms total=3986ms
+2026-05-15 01:45:00.996 | [목표미달] 점수: 4310점 | 등수: 813등
+2026-05-15 01:45:16.098 | [Timing] === 반복 시작 (ts=1778777116098) ===
+2026-05-15 01:45:16.493 | [Timing] probe created force_first_hit=True settle_ms=250 loop_interval_s=0.45
+2026-05-15 01:45:19.776 | [Timing] probe.step first call: res=hit elapsed_from_await_enter=3283ms settle_done_at=3078ms settle_reason=gui_ready capture_ms=205ms
+2026-05-15 01:45:20.837 | [OCRv2] champ=956ms(cache=Y) pts:single=4310(conf=66,4d,raw='4310')→4310 anchor=AnchorValue(value=4310, timestamp_ms=1778777100977)/OK rank:single(conf=59,3d,raw='811')→811 (18+13ms)
+2026-05-15 01:45:20.838 | [Timing] start→await=395ms await→home_hit=3284ms home_hit→ocr_start=0ms ocr=1061ms total=4740ms
+2026-05-15 01:45:20.839 | [목표미달] 점수: 4310점 | 등수: 811등

@@ -33,6 +33,12 @@ class UpdateDialog(ctk.CTkToplevel):
         self._new_exe_path: Path | None = None
         self._downloading = False
 
+        # X 버튼 핸들러 — 다운로드 중엔 무시
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+        # 메인 창(오버레이)이 topmost여도 이 다이얼로그가 위에 뜨도록
+        self._ensure_on_top(parent)
+
         # ── 레이아웃 ──
         pad = {"padx": 20, "pady": 8}
 
@@ -63,17 +69,19 @@ class UpdateDialog(ctk.CTkToplevel):
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(side="bottom", fill="x", padx=20, pady=12)
 
-        ctk.CTkButton(
+        self._btn_open = ctk.CTkButton(
             btn_frame, text="릴리즈 페이지 열기",
             fg_color="transparent", border_width=1,
             command=lambda: webbrowser.open(html_url),
-        ).pack(side="left")
+        )
+        self._btn_open.pack(side="left")
 
-        ctk.CTkButton(
+        self._btn_later = ctk.CTkButton(
             btn_frame, text="나중에",
             fg_color="transparent", border_width=1,
-            command=self.destroy,
-        ).pack(side="left", padx=(8, 0))
+            command=self._on_close_request,
+        )
+        self._btn_later.pack(side="left", padx=(8, 0))
 
         if exe_asset:
             self._btn_update = ctk.CTkButton(
@@ -83,9 +91,61 @@ class UpdateDialog(ctk.CTkToplevel):
             )
             self._btn_update.pack(side="right")
         else:
+            self._btn_update = None
             ctk.CTkLabel(
                 btn_frame, text="(직접 다운로드 필요)", text_color="gray", font=ctk.CTkFont(size=11),
             ).pack(side="right")
+
+    # ──────────────────────────────────────────
+    # z-order 보장
+    # ──────────────────────────────────────────
+
+    def _ensure_on_top(self, owner):
+        """메인 창이 topmost여도 이 다이얼로그를 그 위에 올린다."""
+        try:
+            was_top = bool(int(owner.wm_attributes("-topmost")))
+            if was_top:
+                owner.attributes("-topmost", False)
+        except Exception:
+            was_top = False
+
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+        self.after(0,   lambda: (self.lift(), self.focus_force()))
+        self.after(60,  lambda: (self.lift(), self.focus_force()))
+        self.after(200, lambda: (self.lift(), self.focus_force()))
+
+        if was_top:
+            def _restore():
+                try:
+                    owner.attributes("-topmost", True)
+                    # owner topmost 복원 직후 dialog를 다시 올려야 밀리지 않음
+                    self.lift()
+                    self.focus_force()
+                except Exception:
+                    pass
+            self.after(150, _restore)
+
+    # ──────────────────────────────────────────
+    # 닫기 제어
+    # ──────────────────────────────────────────
+
+    def _on_close_request(self):
+        """X 버튼 / 나중에 버튼 — 다운로드 중엔 무시."""
+        if self._downloading:
+            return
+        self.destroy()
+
+    def _lock_ui(self):
+        """다운로드 시작 시 닫기 관련 UI 전부 비활성화."""
+        self._btn_later.configure(state="disabled")
+        self._btn_open.configure(state="disabled")
+
+    def _unlock_ui(self):
+        """다운로드 실패/취소 시 UI 복구."""
+        self._btn_later.configure(state="normal")
+        self._btn_open.configure(state="normal")
 
     # ──────────────────────────────────────────
     # 다운로드
@@ -99,7 +159,9 @@ class UpdateDialog(ctk.CTkToplevel):
             return
 
         self._downloading = True
-        self._btn_update.configure(state="disabled", text="다운로드 중...")
+        self._lock_ui()
+        if self._btn_update:
+            self._btn_update.configure(state="disabled", text="다운로드 중...")
         self._progress.pack(fill="x", padx=20, pady=(0, 4))
         self._progress_label.pack(padx=20, anchor="w")
 
@@ -112,6 +174,7 @@ class UpdateDialog(ctk.CTkToplevel):
                     exe_asset["url"],
                     dest,
                     progress_cb=self._on_progress,
+                    expected_size=int(exe_asset.get("size") or 0),
                 )
                 self.after(0, self._on_download_complete)
             except Exception as e:
@@ -140,10 +203,12 @@ class UpdateDialog(ctk.CTkToplevel):
 
     def _on_download_complete(self):
         try:
+            self._downloading = False  # 재시작은 의도된 종료이므로 닫기 허용
             self._progress.set(1.0)
             self._progress_label.configure(text="다운로드 완료! 교체 후 재시작합니다...")
-            self._btn_update.configure(text="재시작", state="normal", fg_color="#16a34a")
-            self._btn_update.configure(command=self._apply_and_restart)
+            if self._btn_update:
+                self._btn_update.configure(text="재시작", state="normal", fg_color="#16a34a")
+                self._btn_update.configure(command=self._apply_and_restart)
         except Exception:
             pass
 
@@ -163,7 +228,9 @@ class UpdateDialog(ctk.CTkToplevel):
     def _on_download_error(self, msg: str):
         try:
             self._downloading = False
-            self._btn_update.configure(state="normal", text="다시 시도")
+            self._unlock_ui()
+            if self._btn_update:
+                self._btn_update.configure(state="normal", text="다시 시도")
             self._progress_label.configure(text=f"오류: {msg}", text_color="#f87171")
         except Exception:
             pass

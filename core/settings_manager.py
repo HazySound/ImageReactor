@@ -46,14 +46,16 @@ DEFAULTS: Dict[str, Any] = {
         "events": {
             "goal_achieved":  { "enabled": True },
             "client_crashed": { "enabled": True },
-            "freeze_detected":{ "enabled": True }
+            "freeze_detected":{ "enabled": True },
+            "goal_uncertain": { "enabled": True }
         },
 
         # 이벤트별 '운용 템플릿'(선택): 비어 있으면 폴백 경로로
         "templates": {
             "goal_achieved":  { "subject": "", "body": "" },
             "client_crashed": { "subject": "", "body": "" },
-            "freeze_detected":{ "subject": "", "body": "" }
+            "freeze_detected":{ "subject": "", "body": "" },
+            "goal_uncertain": { "subject": "", "body": "" }
         },
 
         # 사용자 정의 기본값(Defaults): 초기 생성 시 채워서 배포/복구용으로 사용
@@ -67,6 +69,10 @@ DEFAULTS: Dict[str, Any] = {
                 "body":    ""
             },
             "freeze_detected":{
+                "subject": "",
+                "body":    ""
+            },
+            "goal_uncertain": {
                 "subject": "",
                 "body":    ""
             }
@@ -151,7 +157,42 @@ def _spam_defaults():
 # DEFAULTS 사전 정의부 안에서 "park" 아래쪽에 이어서 다음 두 항목을 넣는다.
 # (기존 DEFAULTS 선언부에서 적절한 위치에 삽입)
 DEFAULTS["goal"] = _goal_defaults()
-DEFAULTS["ocr"] = {"roi_rank": None, "roi_points": None}
+DEFAULTS["ocr"] = {
+    "roi_rank": None,
+    "roi_points": None,
+    # --- v2 파이프라인 기본값 ---
+    "use_v2": True,                              # 새 OCR 파이프라인 사용 여부
+    "champion_roi_ratio": [0.14, 0.22, 0.25, 0.13],  # 챔피언스 헤더 비율 ROI
+    "champion_bbox_cache": None,                 # 자가 정제 캐시 (해상도 변경 시 무효화)
+    # anchor 검증 임계
+    "anchor_max_age_hours": 6.0,
+    # 점수 1판 변동 임계 (사용자 실측: 최대 ±60, 노이즈 마진 20 = 80)
+    # 누적 outlier 시 main 측 카운터로 base × counter 만큼 동적 확장.
+    "delta_thresh_up": 80,
+    "delta_thresh_down": 80,
+    "boundary_distance": 30,
+    "bootstrap_min_conf": 50,
+    # 단일 OCR 신뢰도 임계
+    "conf_thresh_normal": 70,
+    "conf_thresh_boundary": 60,
+    # 앙상블 발동 합의율 (이 미만이면 ensemble로 재검증)
+    "ensemble_min_agreement": 0.8,
+    # 디버그: NOT_CHAMPIONS 판정 시 ROI crop을 BASE_DIR/debug_champ/ 에 저장
+    "debug_champ_dump": False,
+    # 디버그: 등수 OCR에 0/6/9 포함 + 마진/점수 낮을 때 ROI 자동 dump.
+    # reference matching 의심 케이스 fine-tune 진단용. 평소엔 False, 디버깅 시에만 True.
+    "debug_rank_dump": False,
+    # 임시 진단: OCR 단계별 timing/결과를 BASE_DIR/ocr_diag.log 에 append
+    # 평소엔 False (로그 누적 방지), 진단 필요 시에만 True.
+    "diag_log_enabled": False,
+    # UNCERTAIN streak 알림
+    "uncertain_alert_threshold": 3,        # 연속 N회 OCR_UNCERTAIN 시 알림
+    "uncertain_alert_cooldown_min": 30,    # 발송 후 N분 동안 재발송 금지
+    # 거리 기반 적응형 confirm_samples (점수 모드 한정)
+    "adaptive_confirm_close": 5,           # 거리 ≤ 10 일 때 최소 confirm 샘플 수
+    "adaptive_confirm_near": 4,            # 거리 ≤ 30 일 때 최소 confirm 샘플 수
+    "adaptive_confirm_far_distance": 100,  # 이 거리보다 멀면 기본 confirm 사용
+}
 
 
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:

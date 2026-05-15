@@ -19,6 +19,7 @@ import sys
 import os
 import mss
 import re
+import threading
 from pathlib import Path
 from core.settings_manager import SettingsManager
 from core.goal_policy import GoalPolicy, build_goal_policy
@@ -142,6 +143,19 @@ def SETTINGS() -> SettingsManager:
         from core.settings_manager import SettingsManager  # 상단 import 유지 가능
         _SETTINGS_SM = SettingsManager(SETTINGS_JSON)
     return _SETTINGS_SM
+
+
+# --- 점수 앵커 싱글턴 (v2 파이프라인 전용) ---
+_SCORE_ANCHOR = None  # type: Optional[Any]
+
+
+def SCORE_ANCHOR():
+    """ScoreAnchor 싱글턴. settings 주입 후 lazily 생성."""
+    global _SCORE_ANCHOR
+    if _SCORE_ANCHOR is None:
+        from core.score_anchor import ScoreAnchor
+        _SCORE_ANCHOR = ScoreAnchor(SETTINGS())
+    return _SCORE_ANCHOR
 
 
 # 예약 종료 컨트롤러 준비
@@ -271,11 +285,16 @@ def log_scheduled_shutdown_state_current():
 # ↓ 모든 전역 상수 계산부를 함수화/지연화하거나, 초기화 시점에만 한 번 읽도록 변경
 _LOOP_INTERVAL_SEC = float(SETTINGS().get("perf.loop_interval_sec", 0.45))
 _IDLE_SLEEP_SEC    = float(SETTINGS().get("perf.idle_sleep_sec", 0.016))
-_AWAIT_STEP_MIN_MS = int(SETTINGS().get("perf.await_step_min_ms", 140))
+_AWAIT_STEP_MIN_MS = int(SETTINGS().get("perf.await_step_min_ms", 80))
 
 # --- GUI busy 워치독/스로틀 파라미터 ---
+# busy_throttle_sec 의미: ui_busy=True 일 때 worker thread 가 매 iter 양보로
+# sleep 하는 시간. GUI thread(폴 300ms 주기)에 처리 시간 양보용.
+# 기존 0.35s는 GUI 폴 1회분 대비 과도 → settle 가드(250ms) 안에서 5~7회 iter
+# 누적되어 정체 2000ms+. 0.1s 면 GUI 폴(300ms) 1회 안에 3회 양보 → 동기화 유지
+# 하면서 정체 대폭 단축.
 _BUSY_WATCHDOG_MS = int(SETTINGS().get("perf.busy_watchdog_ms", 2000))   # 2s
-_BUSY_THROTTLE_SEC = float(SETTINGS().get("perf.busy_throttle_sec", 0.35))# 350ms
+_BUSY_THROTTLE_SEC = float(SETTINGS().get("perf.busy_throttle_sec", 0.1))# 100ms
 
 # --- busy 워치 상태(전역) ---
 _BUSY_SINCE_MS: int = 0
@@ -379,6 +398,27 @@ def _capture_frame_bgr_like_gui() -> np.ndarray:
         return bgr
 
 
+def _ocr_diag_log(line: str) -> None:
+    """OCR 진단 라인을 BASE_DIR/ocr_diag.log 에 append.
+
+    settings의 ocr.diag_log_enabled 가 True 일 때만 동작.
+    임시 진단용 — 미니PC에서 이 파일 하나만 복사해 분석할 수 있도록 한다.
+    분석 끝나면 settings.json 에서 ocr.diag_log_enabled = false 로 끄기.
+    """
+    try:
+        if not bool(SETTINGS().get("ocr.diag_log_enabled", False)):
+            return
+        from path_manager import BASE_DIR
+        import os
+        path = os.path.join(BASE_DIR, "ocr_diag.log")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ms = int(time.time() * 1000) % 1000
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts}.{ms:03d} | {line}\n")
+    except Exception:
+        pass
+
+
 def _downscale_like_gui(bgr: np.ndarray) -> tuple[np.ndarray, float]:
     """
     GUI 검증창과 동일 규칙으로 프레임을 다운스케일.
@@ -424,11 +464,29 @@ _CONFIRM_WINDOW_MS = 350  # 초기값(자동 튜닝으로 갱신)
 # --- AWAIT_HOME settle 하드가드 ---
 _AWAIT_ENTER_MS: Optional[int] = None   # AWAIT_HOME 진입 시각(ms)
 _AWAIT_SETTLE_MS: int = 1200            # 현재 사이클 settle 목표(ms)
+_AWAIT_SETTLE_DONE_MS: Optional[int] = None  # 진단: settle 가드 통과 첫 시점(ms)
+# GUI hidden 후 OS 컴포지터 turn 보장용 추가 grace (ms)
+_GUI_HIDDEN_GRACE_MS: int = 50
+# ui_busy stuck 등으로 GUI hidden 신호 못 받을 때 fallback timeout (ms)
+_AWAIT_HARD_TIMEOUT_MS: int = 1500
 # [추가] 파일 상단 전역(다른 전역들과 같은 레벨)
 _RUNTIME_LOG_CB = None
 # --- [ADD] 홈-OCR 제어 플래그 ---
 _WANT_AWAIT_HOME: bool = False   # 루틴 단락이 실제로 발생했을 때만 AWAIT_HOME 시작
 _HOME_OCR_DONE: bool = False     # '현재 홈 체류'에서 OCR을 1회 수행했는가
+# --- UNCERTAIN streak (시즌말 stop 누락 대비 알림용) ---
+_UNCERTAIN_STREAK: int = 0
+_LAST_UNCERTAIN_ALERT_MS: int = 0
+# 점수 anchor 누적 outlier 카운터: 임계 = base × 카운터.
+# 1판당 base. outlier 발생 시 +1 → 다음 사이클은 2판 누적 가정 → 임계 2배.
+# 정상 통과 시 1 로 reset (anchor 갱신과 함께).
+# 상한(예: 10) 도달 시 anchor reset → 부트스트랩 재시작.
+_ANCHOR_OUTLIER_COUNTER: int = 1
+_ANCHOR_OUTLIER_COUNTER_MAX: int = 10
+# --- 임시 진단: 사이클 단계별 timing ---
+_ROUTINE_START_MS: int = 0      # "반복 시작" 시점
+_HOME_HIT_MS: int = 0           # HomeProbe res == "hit" 시점
+_OCR_START_MS: int = 0          # m0 OCR 호출 직전 시점
 
 # --- [SPAM MODE] 전역 ---
 _SPAM_CFG = {
@@ -466,6 +524,9 @@ def reset_runtime_state() -> None:
 
     _WANT_AWAIT_HOME = False
     _HOME_OCR_DONE = False
+
+    # anchor 누적 outlier 카운터 — routine 시작 시 항상 1 로 reset
+    globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
 
     # 루틴 ROI 캐시(메모리)도 세션 시작 시 초기화
     _ROUTINE_ROI.clear()
@@ -681,10 +742,10 @@ def _routine_roi_commit_from_bbox(image_filename: str, bbox: tuple[int,int,int,i
 
 
 # --- GUI 안정화 대기: OCR 전 GUI withdraw가 화면에서 완전히 사라질 시간을 보장 ---
-def _wait_gui_hidden_for_ocr(max_wait_ms: int = 450) -> None:
+def _wait_gui_hidden_for_ocr(max_wait_ms: int = 250) -> None:
     """
     GUI가 ocr_sampling_active=True를 감지하여 withdraw()될 시간을 짧게 확보한다.
-    - 폴러 주기(≈200ms)를 감안해 기본 450ms 대기(최소치 보장).
+    - 폴러 주기(≈200ms)를 감안해 기본 250ms 대기(최소치 보장).
     - 향후 state_store에 'gui_hidden_ack' 같은 플래그가 생기면 여기서 폴링하도록 확장 가능.
     """
     import time
@@ -929,7 +990,8 @@ def _do_click(center_xy: Optional[Tuple[int,int]], *, label: str = "", src_img: 
 
 def _do_key(key: str, *, label: str = "", src_img: str | None = None):
     try:
-        pyd.keyDown(key); time.sleep(0.05); pyd.keyUp(key)
+        k = key.lower()
+        pyd.keyDown(k); time.sleep(0.05); pyd.keyUp(k)
         # 스팸모드에서는 키 로그 억제
         if label != "spam":
             _log(f"[action] key '{key}'")
@@ -1202,6 +1264,27 @@ def load_routine_from_json(path="./routine.json"):
 
 def execute_routine(routine_list):
     global _HOME_OCR_DONE, _WANT_AWAIT_HOME, _AWAIT_HOME_CONF
+
+    # [목표달성 모드 단축경로]
+    # 게임이 이미 home 화면이면 routine_items 전체 매칭(50~200ms × N개) 비용을 피하고
+    # home anchor 만 우선 시도. hit 이면 즉시 AWAIT_HOME 트리거.
+    # miss 이면 게임 진행 중이므로 일반 routine 매칭으로 진행.
+    try:
+        goal_enabled = bool(SETTINGS().get("goal.enabled", False))
+    except Exception:
+        goal_enabled = False
+    if goal_enabled and GOAL_AVAILABLE and not _HOME_OCR_DONE:
+        for item in routine_list:
+            img_file = img_path + item["image"]
+            if _is_home_anchor(img_file):
+                conf = item.get("conf", 0.8)
+                hit, _ = _routine_locate_adaptive(img_file, conf)
+                if hit:
+                    _WANT_AWAIT_HOME = True
+                    _AWAIT_HOME_CONF = float(conf)
+                    return  # 일반 routine 매칭 skip
+                break  # home anchor miss → 일반 routine 매칭 진행 (게임 중)
+
     for item in routine_list:
         img_file = img_path + item["image"]
         action = item["action"]
@@ -1260,12 +1343,12 @@ def execute_routine(routine_list):
                         return
                 else:
                     _HOME_OCR_DONE = False
-            keys = [k.strip() for k in action.split('+')]
+            keys = [k.strip().lower() for k in action.split('+')]
             try:
                 for k in keys: pyd.keyDown(k)
                 time.sleep(0.05)
                 for k in reversed(keys): pyd.keyUp(k)
-                # _log(f"[action] combo '{action}' img='{os.path.basename(img_file)}'")
+                _log(f"[action] key '{action}'")
             except Exception as e:
                 _log(f"[action][err] combo '{action}' failed: {e}")
 
@@ -1354,18 +1437,10 @@ def _read_metrics_from_current_home(frame_bgr):
 '''
 
 
-def _read_metrics_from_current_home(frame_bgr):
+def _read_metrics_from_current_home_legacy(frame_bgr):
     """
-    GUI 테스트(_open_verify → _run_calib_ocr_and_render → _ocr_digits_with_fallback)와
-    완전히 동일한 파이프라인으로 등수/점수를 읽는다.
-
-    테스트 경로:
-      1) 풀해상도 캡처 → 다운스케일(최대 1200px)
-      2) ROI를 다운스케일 프레임 기준으로 스케일 → 크롭
-      3) read_rank_out_of_range_ko → read_text → read_digits 순서로 OCR
-      4) 첫 번째 숫자 그룹만 사용(_parse_first_int)
-
-    루틴도 이 순서를 그대로 따른다.
+    [DEPRECATED] 기존 OCR 파이프라인. v2 검증 완료 시 제거 예정.
+    호출되지 않음. 비활성화 상태이며 폴백 경로도 아님.
     """
     from core import ocr as _ocr
     from core.roi_from_settings import read_rois_xywh_from_settings, scale_xywh_from_base
@@ -1400,19 +1475,12 @@ def _read_metrics_from_current_home(frame_bgr):
     pts_pil  = _crop_pil("roi_points")
     result   = {}
 
-    # 3) 등수 OCR
     if rank_pil is not None:
-        # (0) 순위권 이탈 전용 탐지
-        # - 컨투어 게이트가 "숫자"로 판정하면 Tesseract 호출 없이 "" 즉시 반환 (빠름)
-        # - "한글"로 판정하면 내부에서 5회 Tesseract 패스로 완전 확인
-        # → 어느 경우든 read_text를 추가로 호출할 필요 없음 (Tesseract 1회 절약)
         oor_fn = getattr(_ocr, "read_rank_out_of_range_ko", None)
         if callable(oor_fn):
             raw_rr = str(oor_fn(rank_pil) or "")
             if raw_rr:
                 result["rank_flag"] = "OUT_OF_RANGE"
-
-        # (1) 숫자 읽기
         if "rank_flag" not in result:
             rd = getattr(_ocr, "read_digits", None)
             if callable(rd):
@@ -1421,7 +1489,6 @@ def _read_metrics_from_current_home(frame_bgr):
                     result["rank"] = v
                     result["rank_flag"] = "NUMERIC"
 
-    # 4) 점수 OCR
     if pts_pil is not None:
         rd = getattr(_ocr, "read_digits", None)
         if callable(rd):
@@ -1430,6 +1497,385 @@ def _read_metrics_from_current_home(frame_bgr):
                 result["points"] = v
 
     return result
+
+
+def _read_metrics_from_current_home(frame_bgr):
+    """
+    [v2] 새 OCR 파이프라인.
+
+    실행 흐름:
+      Stage 0: 챔피언스 티어 게이트
+        - "챔피언스 감독" / "슈퍼 챔피언스 감독" 헤더 검출
+        - 없으면 NOT_CHAMPIONS 플래그로 즉시 종료 (점수/등수 OCR 스킵)
+      Stage 2: HSV 마스킹 + image_to_data 단일 호출
+        - 점수: 화이트리스트 0-9, lang=eng
+        - 등수: 화이트리스트 0-9 + 순위권이탈, lang=kor
+      Stage 3 일부: 앵커 검증
+        - 점수가 anchor 대비 outlier면 앙상블 재검증
+        - 앙상블도 어긋나면 OCR_UNCERTAIN
+
+    반환 dict:
+      성공:        {"rank": int, "rank_flag": "NUMERIC", "points": int, "ts_ms": int}
+      순위권 이탈: {"rank_flag": "OUT_OF_RANGE", "points": int|absent, "ts_ms": int}
+      티어 아님:   {"rank_flag": "NOT_CHAMPIONS", "ts_ms": int}
+      신뢰 부족:   {"rank_flag": "OCR_UNCERTAIN", "ts_ms": int}
+    """
+    try:
+        return _read_metrics_from_current_home_impl(frame_bgr)
+    except Exception as e:
+        # 어떤 예외든 routine_loop을 죽이지 않고 OCR_UNCERTAIN으로 처리
+        _log(f"[OCRv2] exception: {e}")
+        return {"rank_flag": "OCR_UNCERTAIN", "ts_ms": int(time.time() * 1000),
+                "reason": f"exception: {type(e).__name__}"}
+
+
+def _is_bootstrap_worthy(pts_result) -> bool:
+    """앵커 부트스트랩 자격 판단.
+
+    Tesseract LSTM 이 whitelist 사용 시 conf 를 매우 낮게(또는 0으로) 보고하는
+    알려진 이슈가 있다. 실측 결과 정상 OCR 결과도 conf=50~60 정도로 잡힘.
+    따라서 conf 자체보다는 자릿수 검증을 더 신뢰한다.
+
+    통과 조건 (OR):
+    - conf >= 임계값(기본 50) — LSTM 보고 conf 가 신뢰 영역
+    - conf >= 30 AND 자릿수 == 4 — 챔피언스 점수 4자리 정상 케이스
+    - conf == 0 AND 자릿수 == 4 — whitelist conf=0 알려진 이슈 보정
+    """
+    try:
+        min_conf = int(SETTINGS().get("ocr.bootstrap_min_conf", 50))
+    except Exception:
+        min_conf = 50
+    if pts_result.word_conf >= min_conf:
+        return True
+    if pts_result.word_conf >= 30 and pts_result.digit_count == 4:
+        return True
+    if pts_result.word_conf == 0 and pts_result.digit_count == 4:
+        return True
+    return False
+
+
+def _read_metrics_from_current_home_impl(frame_bgr):
+    """실제 OCR 처리 본체. 예외는 호출부에서 잡힘."""
+    from core import ocr_v2 as _ocrv2
+    from core.roi_from_settings import read_rois_xywh_from_settings, scale_xywh_from_base
+
+    ts_ms = int(time.time() * 1000)
+    result: dict = {"ts_ms": ts_ms}
+
+    # ---- 1) 다운스케일 (기존 GUI 테스트 파이프라인과 동일) ----
+    bgr_scaled, _ = _downscale_like_gui(frame_bgr)
+    h_s, w_s = bgr_scaled.shape[:2]
+
+    # ---- 2) Stage 0: 챔피언스 티어 게이트 ----
+    _t_champ = time.time()
+    is_champ, champ_text = _ocrv2.is_champions_tier(bgr_scaled, SETTINGS())
+    result["_dbg_champ_elapsed_ms"] = int((time.time() - _t_champ) * 1000)
+    try:
+        _cache_exists = SETTINGS().get("ocr.champion_bbox_cache", None) is not None
+    except Exception:
+        _cache_exists = False
+    result["_dbg_champ_cache"] = bool(_cache_exists)
+    if not is_champ:
+        # 챔피언스 아님 → 점수/등수 OCR 자체가 무의미. 즉시 반환.
+        result["rank_flag"] = "NOT_CHAMPIONS"
+        result["champ_raw"] = champ_text  # 디버깅용
+        return result
+
+    # ---- 3) ROI 크롭 (기존과 동일 스케일링) ----
+    rois_xywh, base = read_rois_xywh_from_settings(SETTINGS())
+    if not rois_xywh:
+        # ROI 설정 없으면 진행 불가
+        result["rank_flag"] = "OCR_UNCERTAIN"
+        result["reason"] = "no ROI configured"
+        return result
+
+    def _crop_bgr(key):
+        xywh = scale_xywh_from_base(rois_xywh.get(key), base, (w_s, h_s))
+        if not xywh:
+            return None
+        x, y, cw, ch = xywh
+        x = max(0, x - 2); y = max(0, y - 2)
+        x2 = min(w_s, x + cw + 4); y2 = min(h_s, y + ch + 4)
+        if x2 <= x or y2 <= y:
+            return None
+        return bgr_scaled[y:y2, x:x2].copy()
+
+    rank_bgr = _crop_bgr("roi_rank")
+    pts_bgr = _crop_bgr("roi_points")
+
+    # ---- 4) Stage 2: 점수 OCR ----
+    pts_result = None
+    _t_pts = time.time()
+    _pts_route = "none"
+    if pts_bgr is not None:
+        pts_result = _ocrv2.read_points_v2_ref(pts_bgr)
+        _pts_route = "single"
+        result["_dbg_pts_single_raw"] = pts_result.value
+        result["_dbg_pts_single_conf"] = pts_result.word_conf
+        result["_dbg_pts_raw_text"] = pts_result.raw
+        result["_dbg_pts_digit_count"] = pts_result.digit_count
+        if pts_result.kind == "NUMERIC" and isinstance(pts_result.value, int):
+            # 점수 sanity range (챔피언스 2000-9999)
+            if 2000 <= pts_result.value <= 9999:
+                result["points"] = pts_result.value
+            else:
+                # range 밖 → 폐기 후 앙상블 재시도
+                ens = _ocrv2.read_points_v2_ensemble(pts_bgr)
+                _pts_route = "single+ens_range"
+                result["_dbg_ens_range_val"] = ens.final.value
+                result["_dbg_ens_range_agree"] = round(ens.agreement, 2)
+                if (ens.final.kind == "NUMERIC"
+                        and isinstance(ens.final.value, int)
+                        and 2000 <= ens.final.value <= 9999
+                        and ens.agreement >= 0.6):
+                    result["points"] = ens.final.value
+                    pts_result = ens.final
+    result["_dbg_pts_elapsed_ms"] = int((time.time() - _t_pts) * 1000)
+    result["_dbg_pts_route"] = _pts_route
+
+    # ---- 5) 앵커 검증 (점수만) ----
+    # 카운터 방식: 임계 = base × _ANCHOR_OUTLIER_COUNTER (1판당 base, 누적 outlier 시 동적 확장).
+    # 통과 → 카운터 1 로 reset. outlier 확정 → routine_loop 사이클 끝에서 += 1.
+    if "points" in result:
+        anchor = SCORE_ANCHOR()
+        val = anchor.validate(int(result["points"]),
+                              thresh_multiplier=_ANCHOR_OUTLIER_COUNTER)
+        result["_dbg_anchor_val"] = anchor.get_any()
+        result["_dbg_anchor_state"] = val.state
+        if val.state in ("OUTLIER_UP", "OUTLIER_DOWN", "DIGIT_MISMATCH"):
+            result["_dbg_pts_route"] = (result.get("_dbg_pts_route", "") + "+ens_anchor").strip("+")
+            # 누적 임계도 초과 → 앙상블 재검증
+            if pts_bgr is not None:
+                ens = _ocrv2.read_points_v2_ensemble(pts_bgr)
+                if (ens.final.kind == "NUMERIC"
+                        and isinstance(ens.final.value, int)
+                        and 2000 <= ens.final.value <= 9999
+                        and ens.agreement >= 0.6):
+                    ens_val = anchor.validate(ens.final.value,
+                                              thresh_multiplier=_ANCHOR_OUTLIER_COUNTER)
+                    if ens_val.state in ("OK", "NO_ANCHOR", "STALE_ANCHOR"):
+                        # 앙상블 결과가 앵커와 정합 → 채택 + 카운터 reset
+                        result["points"] = ens.final.value
+                        anchor.update(ens.final.value)
+                        globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
+                    else:
+                        # 앙상블도 outlier → 신뢰 불가 (카운터는 routine_loop에서 +1)
+                        result.pop("points", None)
+                        result["anchor_outlier"] = val.reason
+                else:
+                    result.pop("points", None)
+                    result["anchor_outlier"] = val.reason
+        elif val.state == "NO_ANCHOR":
+            # 부트스트랩: 첫 신뢰 OCR로 앵커 설정
+            if pts_result is not None and _is_bootstrap_worthy(pts_result):
+                anchor.update(int(result["points"]))
+                globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
+        elif val.state == "STALE_ANCHOR":
+            # 오래된 앵커 무시. 충분히 신뢰 가능하면 갱신.
+            if pts_result is not None and _is_bootstrap_worthy(pts_result):
+                anchor.update(int(result["points"]))
+                globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
+        elif val.state == "OK":
+            # 정상 통과 — 앵커 업데이트 + 카운터 reset
+            anchor.update(int(result["points"]))
+            globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
+
+    # ---- 5.5) Stage 3: 임계 근처 conf 강화 검증 ----
+    # 목표 임계 근처(boundary_distance 이내)면 conf 임계를 normal(70)→boundary(85)로 강화.
+    # conf 부족 시 앙상블 재검증, 그래도 정합 실패면 OCR_UNCERTAIN 처리.
+    # 시즌말 한 판 차이 상황에서 의심스러운 결과로 stop 하지 않게 막는 안전망.
+    if "points" in result and pts_result is not None:
+        try:
+            _target_pts2 = _active_points_target()
+            if _target_pts2 is not None:
+                _dist2 = abs(int(result["points"]) - _target_pts2)
+                _boundary = int(SETTINGS().get("ocr.boundary_distance", 30))
+                if _dist2 <= _boundary:
+                    _conf_thr = int(SETTINGS().get("ocr.conf_thresh_boundary", 60))
+                    _is_conf_low = (pts_result.word_conf < _conf_thr)
+                    # Tesseract LSTM whitelist 사용 시 conf 를 매우 낮게 보고하는 이슈 예외:
+                    #   - conf == 0 + 자릿수 == 4
+                    #   - conf >= 30 + 자릿수 == 4 (실측 정상 OCR도 conf 50~60 수준)
+                    _is_lstm_low_4d = (
+                        (pts_result.word_conf == 0 and pts_result.digit_count == 4)
+                        or (pts_result.word_conf >= 30 and pts_result.digit_count == 4)
+                    )
+                    if _is_conf_low and not _is_lstm_low_4d:
+                        if pts_bgr is not None:
+                            _ens2 = _ocrv2.read_points_v2_ensemble(pts_bgr)
+                            _agree_min = float(SETTINGS().get("ocr.ensemble_min_agreement", 0.8))
+                            if (_ens2.final.kind == "NUMERIC"
+                                    and isinstance(_ens2.final.value, int)
+                                    and 2000 <= _ens2.final.value <= 9999
+                                    and _ens2.agreement >= _agree_min):
+                                result["points"] = _ens2.final.value
+                                result["boundary_strict_passed"] = True
+                            else:
+                                # 앙상블도 정합 실패 → 신뢰 불가
+                                result.pop("points", None)
+                                result["boundary_strict_failed"] = True
+                                result["rank_flag"] = "OCR_UNCERTAIN"
+                                result["reason"] = "boundary conf strict failed"
+        except Exception:
+            # 검증 실패는 routine 죽이지 않음 — 기존 결과 그대로 진행
+            pass
+
+    # ---- 6) Stage 2: 등수 OCR ----
+    _t_rank = time.time()
+    _rank_route = "none"
+    if rank_bgr is not None:
+        rank_result = _ocrv2.read_rank_v2_ref(rank_bgr, SETTINGS())
+        _rank_route = "single"
+        result["_dbg_rank_raw"] = rank_result.raw
+        result["_dbg_rank_conf"] = rank_result.word_conf
+        result["_dbg_rank_digit_count"] = rank_result.digit_count
+        if rank_result.kind == "OUT_OF_RANGE":
+            result["rank_flag"] = "OUT_OF_RANGE"
+        elif rank_result.kind == "NUMERIC" and isinstance(rank_result.value, int):
+            if 0 < rank_result.value <= 9999:
+                result["rank"] = rank_result.value
+                result["rank_flag"] = "NUMERIC"
+            else:
+                # range 밖 → 앙상블 재시도
+                ens = _ocrv2.read_rank_v2_ensemble(rank_bgr)
+                if (ens.final.kind == "NUMERIC"
+                        and isinstance(ens.final.value, int)
+                        and 0 < ens.final.value <= 9999
+                        and ens.agreement >= 0.6):
+                    result["rank"] = ens.final.value
+                    result["rank_flag"] = "NUMERIC"
+                    _rank_route = "single+ens"
+                elif ens.final.kind == "OUT_OF_RANGE" and ens.agreement >= 0.6:
+                    result["rank_flag"] = "OUT_OF_RANGE"
+                    _rank_route = "single+ens"
+    result["_dbg_rank_elapsed_ms"] = int((time.time() - _t_rank) * 1000)
+    result["_dbg_rank_route"] = _rank_route
+
+    # ---- 6.5) cross-validation: 점수 outlier 확정 시 등수도 의심 처리 ----
+    # 점수 OCR이 anchor 대비 outlier로 확정됐고 (앙상블도 정합 실패),
+    # 같은 사이클의 등수 OCR도 동일 엔진/프레임에서 추출됐으므로 신뢰 불가.
+    # 단, anchor 자체가 부재했다면 (NO_ANCHOR/STALE) outlier 비교가 무의미하므로 제외.
+    if (result.get("anchor_outlier")
+            and ("rank" in result or result.get("rank_flag") == "OUT_OF_RANGE")):
+        result.pop("rank", None)
+        # OUT_OF_RANGE 도 신뢰 못 함 → 덮어씀
+        result["rank_flag"] = "OCR_UNCERTAIN"
+        result["reason"] = "score outlier → rank cross-distrust"
+
+    # ---- 7) 결과 미수렴 처리 ----
+    # rank_flag 가 아직 설정 안 됐고 points도 없으면 OCR_UNCERTAIN
+    if "rank_flag" not in result and "points" not in result:
+        result["rank_flag"] = "OCR_UNCERTAIN"
+
+    return result
+
+
+def _active_goal_info() -> Optional[Dict[str, Any]]:
+    """현재 활성 프리셋의 모드/실질 목표/마진 반환. goal 비활성 시 None.
+
+    반환 dict:
+      {
+        "mode": "points" | "rank",
+        "effective_target": int,  # 마진 적용된 실질 목표 (점수: target-margin, 등수: target+tol)
+        "raw_target": int,        # 원본 목표
+        "margin": int,            # 마진/tolerance
+      }
+    """
+    try:
+        g = SETTINGS().get("goal", {}) or {}
+        if not g.get("enabled", False):
+            return None
+        presets = g.get("presets", {}) or {}
+        pid = g.get("active_preset_id", "")
+        p = presets.get(pid, {}) or {}
+        mode = str(p.get("mode", "rank")).lower().strip()
+        if mode == "points":
+            target = int(p.get("points_target", 0) or 0)
+            margin = int(p.get("points_margin", 0) or 0)
+            return {"mode": "points",
+                    "effective_target": max(0, target - margin),
+                    "raw_target": target, "margin": margin}
+        elif mode == "rank":
+            target = int(p.get("rank_target", 0) or 0)
+            tol = int(p.get("rank_tolerance", 0) or 0)
+            return {"mode": "rank",
+                    "effective_target": max(1, target + tol),
+                    "raw_target": target, "margin": tol}
+        return None
+    except Exception:
+        return None
+
+
+def _fmt_goal_line(m: dict, status_tag: str) -> str:
+    """목표달성/목표미달 로그 1줄 포맷.
+
+    형식: [status_tag] 점수 X / 등수 Y   ←  목표: 점수/등수 N 이상/이내
+    OUT_OF_RANGE / 인식 실패 케이스도 통합 처리.
+    goal 비활성 시 목표 부분 생략.
+    """
+    if not isinstance(m, dict):
+        m = {}
+    # 현재 값 포맷
+    p = m.get("points")
+    p_txt = f"{p}" if isinstance(p, int) else "?"
+    if m.get("rank_flag") == "OUT_OF_RANGE":
+        r_txt = "순위권 이탈"
+    else:
+        r = m.get("rank")
+        r_txt = f"{r}" if isinstance(r, int) else "?"
+    current = f"점수 {p_txt} / 등수 {r_txt}"
+
+    info = _active_goal_info()
+    if info is None:
+        return f"[{status_tag}] {current}"
+    if info["mode"] == "points":
+        target_txt = f"점수 {info['effective_target']} 이상"
+    else:
+        target_txt = f"등수 {info['effective_target']} 이내"
+    return f"[{status_tag}] {current}   ←  목표: {target_txt}"
+
+
+def _active_points_target() -> Optional[int]:
+    """현재 활성 프리셋의 points_target 반환 (점수 모드일 때만).
+
+    거리 기반 적응형 confirm_samples 와 conf_thresh_boundary 적용 판단용.
+    등수 모드면 None 반환 (점수 임계가 정의 안 됨).
+    """
+    try:
+        g = SETTINGS().get("goal", {}) or {}
+        if not g.get("enabled", False):
+            return None
+        presets = g.get("presets", {}) or {}
+        pid = g.get("active_preset_id", "")
+        p = presets.get(pid, {}) or {}
+        if str(p.get("mode", "")).lower().strip() != "points":
+            return None
+        t = int(p.get("points_target", 0) or 0)
+        return t if t > 0 else None
+    except Exception:
+        return None
+
+
+def _adaptive_confirm_samples(distance: Optional[int], base: int) -> int:
+    """목표까지 거리에 따라 confirm_samples 동적 조정.
+
+    distance:
+      ≤ 10     → adaptive_confirm_close (기본 5)
+      ≤ 30     → adaptive_confirm_near  (기본 4)
+      ≤ 100    → base
+      그 외/None → base
+    """
+    if not isinstance(distance, int):
+        return base
+    try:
+        s = SETTINGS()
+        if distance <= 10:
+            return max(base, int(s.get("ocr.adaptive_confirm_close", 5)))
+        if distance <= 30:
+            return max(base, int(s.get("ocr.adaptive_confirm_near", 4)))
+        return base
+    except Exception:
+        return base
 
 
 def _is_goal_met_by_settings(m: dict) -> bool:
@@ -1495,6 +1941,8 @@ def routine_loop(stop_event_global, state_cb, log_cb):
     # 전역 간격 변수 초기화(초깃값 350 → 설정값으로 덮어씀)
     global _HOME_TPL_PATH, _CACHED_ROI, _SKIP_FILE_ROI_ONCE, _CONFIRM_WINDOW_MS, _AWAIT_ENTER_MS, _AWAIT_SETTLE_MS
     global _RUNTIME_LOG_CB, _WANT_AWAIT_HOME, _HOME_OCR_DONE
+    global _UNCERTAIN_STREAK, _LAST_UNCERTAIN_ALERT_MS
+    global _ROUTINE_START_MS, _HOME_HIT_MS, _OCR_START_MS
     _CONFIRM_WINDOW_MS = _GOAL_CONFIRM_WINDOW_MS
     _RUNTIME_LOG_CB = log_cb
 
@@ -1571,6 +2019,18 @@ def routine_loop(stop_event_global, state_cb, log_cb):
             start_event.clear()
             stop_event.clear()  # ★ 추가: 재시작 시 전역 stop 잔류 제거
             log_cb("\n============반복 시작============")
+            _ROUTINE_START_MS = int(time.time() * 1000)
+            _HOME_HIT_MS = 0
+            _OCR_START_MS = 0
+            _ocr_diag_log(f"[Timing] === 반복 시작 (ts={_ROUTINE_START_MS}) ===")
+            # routine 시작 = 사용자가 클릭 완료하고 진행 의사를 명확히 한 시점.
+            # ButtonRelease-1 이벤트가 누락된 경우라도 ui_busy 잔여로 routine_loop
+            # 첫 iter들이 매번 0.3초 throttle 누적되어 start→await가 3초+로 부풀려짐.
+            # 시작 신호 = ui_busy 강제 해제로 첫 사이클부터 정상 진행.
+            try:
+                get_state_store().set_ui_busy(False)
+            except Exception:
+                pass
             reset_runtime_state()
             state_cb("RUNNING")
 
@@ -1602,16 +2062,24 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                     state_cb("IDLE")
                     break
                 if now - last_run < interval:
-                    time.sleep(0.01)  # interval 대기 중 CPU 스핀 방지
-                    continue
-                if now - last_run >= interval:
-                    # ★ 드래그 중엔 루틴 실행 자체를 건너뛰어 클릭/탬플릿매칭 비용 차단
-                    try:
-                        if _busy_throttle_gate(store):
-                            last_run = now
-                            continue
-                    except Exception:
-                        pass
+                    # AWAIT_HOME 상태(probe 살아있음)에서는 interval 가드 우회.
+                    # 별도의 settle 250ms + polling 가드(80ms)가 이미 적용되므로
+                    # routine 매칭 빈도용 interval 까지 더해질 이유가 없다.
+                    if probe is None:
+                        time.sleep(0.01)  # interval 대기 중 CPU 스핀 방지
+                        continue
+                if now - last_run >= interval or probe is not None:
+                    # AWAIT_HOME(probe 살아있음) 중에는 busy_throttle_gate 우회.
+                    # busy 상태가 watchdog 2s + cleanup 220ms 동안 stuck 되면
+                    # 매 iter 350ms throttle 누적 → AWAIT_HOME 정체 직접 원인.
+                    # probe.step 은 force_first_hit으로 1회 hit이라 throttle 의미 없음.
+                    if probe is None:
+                        try:
+                            if _busy_throttle_gate(store):
+                                last_run = now
+                                continue
+                        except Exception:
+                            pass
 
                     if _SPAM_ACTIVE:
                         _spam_tick()
@@ -1657,21 +2125,29 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                     if _goal_enabled_now() and GOAL_AVAILABLE and _WANT_AWAIT_HOME:
                         if probe is None:
                             _WANT_AWAIT_HOME = False  # ← 소비하고 바로 리셋
-                            # [FIX] 루틴 감지 conf와 home_anchor.json 임계값 중 낮은 값 사용
-                            # → 루틴이 감지한 스코어를 probe가 재확인 못하는 임계값 불일치 방지
+                            # [옵션 A] routine 매칭에서 이미 home anchor 가 hit 된 시점이
+                            # home 화면 확정의 가장 강한 증거. probe 의 settle / polling /
+                            # 재매칭 단계는 redundant 이므로 fast track 으로 즉시 hit 반환.
                             _probe_thr = min(load_home_anchor_threshold(), float(_AWAIT_HOME_CONF))
                             probe = HomeProbe(
                                 ncc_threshold=_probe_thr,
                                 soft_timeout_ms=8000,
-                                hard_timeout_ms=12000
+                                hard_timeout_ms=12000,
+                                force_first_hit=True,
                             )
                             probe.start()
                             _home_ff_limiter_reset()
                             _log_home_ff("reset", 0, 2, "enter")
-                            settle_ms = _AUTOLEARN.current_settle_ms()
-                            state_cb(f"AWAIT_HOME_ENTER|SETTLE={settle_ms}")
+                            state_cb("AWAIT_HOME_ENTER|FAST_TRACK")
+                            # [옵션 3] AWAIT_HOME 진입 시 GUI 숨김 시작.
+                            # settle 250ms 동안 GUI 폴러가 withdraw 처리 → 그 후 캡처 1회.
+                            get_state_store().set_ocr_sampling_active(True)
                             _AWAIT_ENTER_MS = int(time.time() * 1000)
-                            _AWAIT_SETTLE_MS = max(int(settle_ms), 1000)
+                            _AWAIT_SETTLE_MS = 250  # GUI 사라질 시간
+                            _ocr_diag_log(
+                                f"[Timing] probe created force_first_hit={getattr(probe, 'force_first_hit', '?')} "
+                                f"settle_ms={_AWAIT_SETTLE_MS} loop_interval_s={_LOOP_INTERVAL_SEC}"
+                            )
                             globals()["_DEBUG_OCR_DUMPED"] = False  # ← 덤프 1회 가드 리셋
                             # --- FREEZE 모니터 시작 ---
                             if freeze is None or freeze.is_disabled:
@@ -1683,28 +2159,39 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         probe = None  # Goal 비활성/불가 → AWAIT_HOME 강제 해제
 
                 if probe is not None:
-                    # ★ 드래그 중이면 캡처/매칭/프리즈틱 자체를 잠깐 쉰다
-                    try:
-                        if _busy_throttle_gate(store):
-                            continue
-                    except Exception:
-                        pass
+                    # AWAIT_HOME 진행 중에는 busy_throttle_gate 우회 (직접 정체 원인).
+                    # probe.step은 force_first_hit으로 즉시 hit이라 throttle 의미 없음.
 
-                    # [ADD] AWAIT_HOME settle 하드가드: 아직 초기 대기(ms) 미만이면 step을 건너뜀
+                    # AWAIT_HOME settle 가드: GUI hidden 명시적 동기화 + hard timeout fallback.
+                    # 기존 settle_ms 단순 sleep 대신 store.gui_hidden_at_ms polling 으로
+                    # OS 컴포지터 turn 까지 보장. ui_busy stuck 등으로 신호 못 받으면
+                    # hard timeout 후 캡처 진행 (이전 동작과 동등).
                     if _AWAIT_ENTER_MS is not None:
                         now_ms = int(time.time() * 1000)
-                        if now_ms - _AWAIT_ENTER_MS < _AWAIT_SETTLE_MS:
+                        elapsed = now_ms - _AWAIT_ENTER_MS
+                        hidden_at = get_state_store().get_gui_hidden_at()
+                        # GUI 가 _AWAIT_ENTER_MS 이후에 hidden 됐고, 컴포지터 turn grace 도 경과
+                        gui_ready = (hidden_at >= _AWAIT_ENTER_MS
+                                     and (now_ms - hidden_at) >= _GUI_HIDDEN_GRACE_MS)
+                        # hard timeout: ui_busy stuck 등으로 GUI hidden 신호 못 받으면 fallback
+                        timed_out = elapsed >= _AWAIT_HARD_TIMEOUT_MS
+                        if not gui_ready and not timed_out:
                             # freeze 모니터링은 계속 진행(홈이 아니므로 안전)
                             if freeze is not None and not freeze.is_disabled:
                                 nowf = time.time()
                                 if nowf - _frz_last_cap_ts >= freeze.cfg.interval_sec:
-                                    fbgr = _capture_frame_bgr()  # 필요시 중앙부 ROI로 줄여도 OK
+                                    fbgr = _capture_frame_bgr()
                                     cnt = freeze.tick(fbgr)
-
                                     _frz_last_cap_ts = nowf
-
                             time.sleep(_IDLE_SLEEP_SEC)
                             continue
+                        # 진단: settle 가드 통과 첫 시점 1회 기록
+                        if globals().get("_AWAIT_SETTLE_DONE_MS") is None:
+                            globals()["_AWAIT_SETTLE_DONE_MS"] = now_ms
+                            # 진단용 부가 정보: 통과 사유 (gui_ready / timed_out)
+                            globals()["_AWAIT_SETTLE_REASON"] = (
+                                "gui_ready" if gui_ready else "timed_out"
+                            )
 
                     # ★ 프레임 캡처 최소 간격 가드(기본 140ms)
                     now_ms = int(time.time() * 1000)
@@ -1714,15 +2201,36 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         continue
                     globals()["_AWAIT_LAST_STEP_MS"] = now_ms
 
+                    # 진단: capture 단독 시간 측정 (첫 호출만)
+                    _cap_t0 = int(time.time() * 1000)
                     frame_bgr = _capture_frame_bgr_like_gui()  # GUI와 동일 파이프라인로 캡처
-                    res = probe.step(frame_bgr, _match_home_anchor, cached_home_roi)
+                    _cap_ms = int(time.time() * 1000) - _cap_t0
 
-                    # ★ 여기서도 busy면 프리즈틱 스킵
-                    try:
-                        if _busy_throttle_gate(store):
-                            continue
-                    except Exception:
-                        pass
+                    res = probe.step(frame_bgr, _match_home_anchor, cached_home_roi)
+                    # 진단: probe 의 첫 step 시점 / 결과 / settle 후 경과 시간
+                    if probe is not None and not getattr(probe, "_logged_first_step", False):
+                        try:
+                            _now_ms = int(time.time() * 1000)
+                            _elapsed = _now_ms - (_AWAIT_ENTER_MS or 0)
+                            _settle_done = globals().get("_AWAIT_SETTLE_DONE_MS")
+                            _settle_done_at = (_settle_done - (_AWAIT_ENTER_MS or 0)) if _settle_done else -1
+                            # 통합 timing 라인: settle 통과 시점 + capture 단독 시간 포함
+                            _settle_reason = globals().get("_AWAIT_SETTLE_REASON", "?")
+                            _ocr_diag_log(
+                                f"[Timing] probe.step first call: res={res} "
+                                f"elapsed_from_await_enter={_elapsed}ms "
+                                f"settle_done_at={_settle_done_at}ms "
+                                f"settle_reason={_settle_reason} "
+                                f"capture_ms={_cap_ms}ms"
+                            )
+                        except Exception:
+                            pass
+                        probe._logged_first_step = True
+                        # 다음 AWAIT_HOME 사이클 위해 settle_done / reason 리셋
+                        globals()["_AWAIT_SETTLE_DONE_MS"] = None
+                        globals()["_AWAIT_SETTLE_REASON"] = None
+
+                    # AWAIT_HOME busy_throttle_gate 우회 (직접 정체 원인 제거).
 
                     # --- 홈 아님(pending/miss)일 때만 freeze 샘플 ---
                     if res != "hit" and freeze is not None and not freeze.is_disabled:
@@ -1734,6 +2242,7 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                             _frz_last_cap_ts = nowf
 
                     if res == "hit":
+                        _HOME_HIT_MS = int(time.time() * 1000)
                         if freeze is not None:
                             try:
                                 # 홈 진입 순간엔 프리즈 누적 카운터/해시를 초기화하고 샘플링을 끈다.
@@ -1756,24 +2265,87 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         # HOME 진입 훅: 정책 스냅샷 고정
                         goal_policy.on_home_enter()  # 프리셋 스냅샷 고정/버퍼 초기화 :contentReference[oaicite:10]{index=10}
 
-                        # OCR 중 UI 잠금
-                        get_state_store().set_ocr_sampling_active(True)
+                        # [옵션 3] frame_bgr 재사용 + GUI 즉시 복구
+                        # AWAIT_HOME 진입 시점에 이미 GUI 숨김 신호를 보냈고
+                        # settle 250ms 동안 withdraw 처리됨. probe.step 시점 캡처는
+                        # GUI 없는 상태이므로 OCR 에 그대로 재사용.
+                        # 캡처가 끝났으니 GUI 즉시 복구 — OCR 진행 중에도 사용자 시야 확보.
+                        get_state_store().set_ocr_sampling_active(False)
 
-                        # ---- 조건부 다중확인(최대 2회 추가) ----
-                        # === BASELINE OCR (hit 프레임 고정) ===
-                        # m0는 프로브 hit 시점의 frame_bgr를 재사용하므로
-                        # GUI withdrawal 대기 없이 즉시 처리 가능 (GUI가 ROI를 가리지 않음)
                         samples_ok = []
                         reached = False
                         metrics = None
 
-                        m0 = _read_metrics_from_current_home(frame_bgr)
+                        _ocr_frame = frame_bgr  # probe.step 시점 캡처 재사용
+                        _OCR_START_MS = int(time.time() * 1000)
+                        m0 = _read_metrics_from_current_home(_ocr_frame)
                         m0 = _coerce_metric_values(m0 or {})
+
+                        # ── 진단 로그: OCR 단계별 결과/타이밍 한 줄 압축 ──
+                        try:
+                            _ch_ms = m0.get("_dbg_champ_elapsed_ms", "?")
+                            _ch_cache = "Y" if m0.get("_dbg_champ_cache") else "N"
+                            _pts_ms = m0.get("_dbg_pts_elapsed_ms", "?")
+                            _rk_ms = m0.get("_dbg_rank_elapsed_ms", "?")
+                            _pts_route = m0.get("_dbg_pts_route", "?")
+                            _rk_route = m0.get("_dbg_rank_route", "?")
+                            _pts_single = m0.get("_dbg_pts_single_raw", "?")
+                            _pts_conf = m0.get("_dbg_pts_single_conf", "?")
+                            _anchor_v = m0.get("_dbg_anchor_val", "?")
+                            _anchor_s = m0.get("_dbg_anchor_state", "?")
+                            _final_pts = m0.get("points", "?")
+                            _final_rk = m0.get("rank", m0.get("rank_flag", "?"))
+                            _pts_raw_text = m0.get("_dbg_pts_raw_text", "")
+                            _pts_dc = m0.get("_dbg_pts_digit_count", "?")
+                            _rank_raw_text = m0.get("_dbg_rank_raw", "")
+                            _rank_conf = m0.get("_dbg_rank_conf", "?")
+                            _rank_dc = m0.get("_dbg_rank_digit_count", "?")
+                            _diag_line = (
+                                f"[OCRv2] champ={_ch_ms}ms(cache={_ch_cache}) "
+                                f"pts:{_pts_route}={_pts_single}(conf={_pts_conf},{_pts_dc}d,raw={_pts_raw_text!r})→{_final_pts} "
+                                f"anchor={_anchor_v}/{_anchor_s} "
+                                f"rank:{_rk_route}(conf={_rank_conf},{_rank_dc}d,raw={_rank_raw_text!r})→{_final_rk} "
+                                f"({_pts_ms}+{_rk_ms}ms)"
+                            )
+                            _ocr_diag_log(_diag_line)
+
+                            # 단계별 timing 진단 — 정체 단계 식별용
+                            _ocr_end_ms = int(time.time() * 1000)
+                            _await_ms = _AWAIT_ENTER_MS or 0  # settle/probe 진입 시각
+                            _t_routine = (_await_ms - _ROUTINE_START_MS) if (_ROUTINE_START_MS and _await_ms) else -1
+                            _t_settle = (_HOME_HIT_MS - _await_ms) if (_await_ms and _HOME_HIT_MS) else -1
+                            _t1 = _HOME_HIT_MS - _ROUTINE_START_MS if _ROUTINE_START_MS else -1
+                            _t2 = _OCR_START_MS - _HOME_HIT_MS if _HOME_HIT_MS else -1
+                            _t3 = _ocr_end_ms - _OCR_START_MS if _OCR_START_MS else -1
+                            _t_total = _ocr_end_ms - _ROUTINE_START_MS if _ROUTINE_START_MS else -1
+                            _timing_line = (
+                                f"[Timing] start→await={_t_routine}ms "
+                                f"await→home_hit={_t_settle}ms "
+                                f"home_hit→ocr_start={_t2}ms "
+                                f"ocr={_t3}ms total={_t_total}ms"
+                            )
+                            _ocr_diag_log(_timing_line)
+                        except Exception:
+                            pass
+
+                        # [v2 단축경로] 챔피언스 티어가 아니면 재시도 무의미.
+                        # 점수/등수 화면 자체가 안 뜨므로 즉시 미달 처리하고 종료.
+                        not_champ = (m0.get("rank_flag") == "NOT_CHAMPIONS")
 
                         # 정책 판단/조기종료 동일 처리
                         if m0.get("rank_flag") == "OUT_OF_RANGE":
                             metrics = m0
                             reached = goal_policy.on_sample(m0)
+                        elif not_champ:
+                            # 챔피언스 아님 → 샘플 추가 의미 없음
+                            metrics = m0
+                            _raw = str(m0.get("champ_raw", "") or "")
+                            _raw_clean = _raw.replace("\n", " / ").strip()
+                            if len(_raw_clean) > 120:
+                                _raw_clean = _raw_clean[:120] + "..."
+                            _not_champ_line = f"[목표체크] 챔피언스 티어 아님 → OCR 스킵 (raw={_raw_clean!r})"
+                            log_cb(_not_champ_line)
+                            _ocr_diag_log(_not_champ_line)
                         else:
                             sane0 = _is_sane_metrics(m0)
                             if sane0:
@@ -1785,19 +2357,31 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                                     reached = True
                                     metrics = m0
 
-                        # === 추가 샘플이 필요할 때만 루프 수행 ===
+                        # === 추가 샘플은 m0가 의심스러울 때만 ===
+                        # m0 신뢰 판정:
+                        #   - NUMERIC + sane → 모든 가드(sanity/anchor/conf/boundary)를
+                        #     이미 통과한 결과이므로 confirm 불필요. 즉시 종료.
+                        #   - OUT_OF_RANGE / NOT_CHAMPIONS → 이미 위에서 처리됨 (reached 결정).
+                        #   - OCR_UNCERTAIN 또는 sane fail → 추가 샘플로 재시도.
                         attempts = 1  # m0를 첫 샘플로 이미 사용
-                        if not reached:
-                            # 추가 샘플은 새 프레임을 캡처하므로 GUI가 화면에서 사라진 뒤여야 함
-                            # m0 OCR 소요 시간 동안 GUI가 이미 철수 중 → 남은 시간만 보충 대기
+                        m0_trusted = (
+                            m0.get("rank_flag") == "NUMERIC"
+                            and _is_sane_metrics(m0)
+                        )
+                        _local_confirm = _GOAL_CONFIRM_SAMPLES
+
+                        if not reached and not not_champ and not m0_trusted:
+                            # 추가 샘플은 새 프레임 캡처가 필요하므로 GUI 를 다시 숨긴다.
+                            # (옵션 3 에서 OCR 시작 직전 GUI 를 복구해놓은 상태)
+                            get_state_store().set_ocr_sampling_active(True)
                             try:
-                                _wait_gui_hidden_for_ocr(max_wait_ms=450)
+                                _wait_gui_hidden_for_ocr(max_wait_ms=250)
                             except Exception:
                                 pass
-                            _div = max(1, _GOAL_CONFIRM_SAMPLES - 1)
+                            _div = max(1, _local_confirm - 1)
                             _spacing_ms = int(max(0, _CONFIRM_WINDOW_MS) / _div)
 
-                            while attempts < _GOAL_CONFIRM_SAMPLES:
+                            while attempts < _local_confirm:
                                 attempts += 1
                                 is_last_try = (attempts == _GOAL_CONFIRM_SAMPLES)
 
@@ -1832,27 +2416,85 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                             if not reached:
                                 reached = _is_goal_met_by_settings(fused)  # ← 로컬 가드
 
-                        # [DEBUG] 미달 요약 로그
+                        # anchor outlier 카운터 갱신 — 사이클 끝 시점에서 한 번만
+                        try:
+                            _outlier_seen = False
+                            for _src in (m0,
+                                         locals().get("fused"),
+                                         locals().get("metrics")):
+                                if isinstance(_src, dict) and _src.get("anchor_outlier"):
+                                    _outlier_seen = True
+                                    break
+                            if _outlier_seen:
+                                globals()["_ANCHOR_OUTLIER_COUNTER"] = _ANCHOR_OUTLIER_COUNTER + 1
+                                # 상한 도달 시 anchor reset → 부트스트랩 재시작
+                                if _ANCHOR_OUTLIER_COUNTER > _ANCHOR_OUTLIER_COUNTER_MAX:
+                                    try:
+                                        SCORE_ANCHOR().reset()
+                                    except Exception:
+                                        pass
+                                    globals()["_ANCHOR_OUTLIER_COUNTER"] = 1
+                        except Exception:
+                            pass
+
+                        # 미달 요약 로그
                         if not reached:
                             try:
-                                def _fmt_line(m: dict) -> str:
-                                    if m.get("rank_flag") == "OUT_OF_RANGE":
-                                        pp = m.get("points")
-                                        pp_txt = f"{pp}점" if isinstance(pp, int) else "N/A"
-                                        return f"점수: {pp_txt} | 등수: 순위권 이탈"
-                                    r, p = m.get("rank"), m.get("points")
-                                    r_txt = f"{r}등" if isinstance(r, int) else "인식 실패"
-                                    p_txt = f"{p}점" if isinstance(p, int) else "인식 실패"
-                                    return f"점수: {p_txt} | 등수: {r_txt}"
-
                                 if 'metrics' in locals() and metrics is not None:
-                                    line = _fmt_line(metrics)
-                                    log_cb(f"[목표미달] {line}")
+                                    _miss_line = _fmt_goal_line(metrics, "목표미달")
                                 elif ('samples_ok' in locals()) and samples_ok:
-                                    line = _fmt_line(samples_ok[-1])  # 최근 유효 샘플로 대체
-                                    log_cb(f"[목표미달] {line}")
+                                    _miss_line = _fmt_goal_line(samples_ok[-1], "목표미달")
                                 else:
-                                    log_cb("[목표미달] valid OCR sample 없음")
+                                    # 점수/등수 둘 다 없음 — 목표 정보만이라도 표시
+                                    _miss_line = _fmt_goal_line({}, "목표미달")
+                                log_cb(_miss_line)
+                                _ocr_diag_log(_miss_line)
+                            except Exception:
+                                pass
+
+                        # ── UNCERTAIN streak 검사 및 알림 ──
+                        # "valid OCR sample 없음" 조건과 동일: 챔피언스 화면이지만 OCR이 흔들려
+                        # 점수/등수를 못 얻은 경우. 시즌말 stop 누락 방지용 알림.
+                        try:
+                            _is_uncertain_cycle = (
+                                (not reached)
+                                and (not samples_ok)
+                                and (not not_champ)
+                                and (m0.get("rank_flag") != "OUT_OF_RANGE")
+                            )
+                            if _is_uncertain_cycle:
+                                _UNCERTAIN_STREAK += 1
+                                _u_thresh = int(SETTINGS().get("ocr.uncertain_alert_threshold", 3))
+                                _u_cool_min = float(SETTINGS().get("ocr.uncertain_alert_cooldown_min", 30))
+                                _now_ms = int(time.time() * 1000)
+                                _cool_ms = int(_u_cool_min * 60 * 1000)
+                                if (_UNCERTAIN_STREAK >= _u_thresh
+                                        and (_now_ms - _LAST_UNCERTAIN_ALERT_MS) >= _cool_ms):
+                                    try:
+                                        _anchor_val = SCORE_ANCHOR().get_any()
+                                    except Exception:
+                                        _anchor_val = None
+                                    _payload = {
+                                        "streak": _UNCERTAIN_STREAK,
+                                        "raw": str(m0.get("champ_raw", ""))[:120],
+                                        "reason": str(m0.get("reason", "")),
+                                        "anchor": _anchor_val,
+                                    }
+                                    _email_guarded("goal_uncertain", _payload)
+                                    _uncertain_line = f"[목표체크] OCR_UNCERTAIN {_UNCERTAIN_STREAK}회 연속 — 알림 발송"
+                                    log_cb(_uncertain_line)
+                                    _ocr_diag_log(_uncertain_line)
+                                    _LAST_UNCERTAIN_ALERT_MS = _now_ms
+                            else:
+                                # 정상 사이클 (NOT_CHAMPIONS/OUT_OF_RANGE/sample 있음/달성) → 리셋
+                                if _UNCERTAIN_STREAK > 0:
+                                    _reset_line = f"[목표체크] UNCERTAIN streak 리셋 (이전={_UNCERTAIN_STREAK})"
+                                    log_cb(_reset_line)
+                                    _ocr_diag_log(_reset_line)
+                                _UNCERTAIN_STREAK = 0
+                        except Exception as _e:
+                            try:
+                                log_cb(f"[목표체크] uncertain check error: {_e}")
                             except Exception:
                                 pass
 
@@ -1860,7 +2502,9 @@ def routine_loop(stop_event_global, state_cb, log_cb):
                         get_state_store().set_ocr_sampling_active(False)
 
                         if reached:
-                            log_cb(f"[목표달성] 점수={metrics.get('points')}점 | 등수={metrics.get('rank')}등")
+                            _achieve_line = _fmt_goal_line(metrics or {}, "목표달성")
+                            log_cb(_achieve_line)
+                            _ocr_diag_log(_achieve_line)
                             _email_guarded("goal_achieved", {"points": metrics.get("points"), "rank": metrics.get("rank")})
 
                             # 1) 러너 쪽에 명시적 종료 신호

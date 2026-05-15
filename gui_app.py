@@ -173,7 +173,8 @@ class OverlayApp(ctk.CTk):
         self._init_goal_ui_bindings()
 
         # ── 단일 UI 틱 설정 ──
-        self._TICK_MS = int(self.settings.get("gui.tick_ms", 250))  # 250~300ms 권장
+        # 로그 즉시 표시를 위해 80ms (12.5fps). batch 처리(tick당 최대 50줄/3ms)는 유지.
+        self._TICK_MS = int(self.settings.get("gui.tick_ms", 80))
         self._ui_tick_guard = False  # 재진입 방지
         # 폴링 예약 핸들(없으면 None)
         self._poll_after_id = None
@@ -199,8 +200,8 @@ class OverlayApp(ctk.CTk):
         self._poll_after_id = self.after(self._TICK_MS, self._poll_controller)
         self._log_gui(f"해상도 : {self.winfo_screenwidth()} X {self.winfo_screenheight()}")
 
-        # 시작 3초 후 백그라운드에서 업데이트 체크
-        self.after(3000, self._check_update_bg)
+        # 시작 500ms 후 백그라운드에서 업데이트 체크
+        self.after(500, self._check_update_bg)
 
         geo = self.settings.get("gui._last_geometry")
         if geo:
@@ -297,8 +298,7 @@ class OverlayApp(ctk.CTk):
     def _show_update_dialog(self, release_info: dict):
         try:
             from ui.update_dialog import UpdateDialog
-            dlg = UpdateDialog(self, release_info)
-            dlg.focus()
+            UpdateDialog(self, release_info)
         except Exception as e:
             print(f"[updater] 다이얼로그 표시 실패: {e}")
 
@@ -780,8 +780,8 @@ class OverlayApp(ctk.CTk):
 
         # 2) 폴링 주기 갱신(다음 after부터 반영)
         try:
-            new_tick = int(self.settings.get("gui.tick_ms", getattr(self, "_TICK_MS", 250)))
-            self._TICK_MS = max(200, min(new_tick, 1000))
+            new_tick = int(self.settings.get("gui.tick_ms", getattr(self, "_TICK_MS", 80)))
+            self._TICK_MS = max(50, min(new_tick, 1000))
         except Exception:
             pass
 
@@ -1068,13 +1068,14 @@ class OverlayApp(ctk.CTk):
                 pass
         self._alpha_leave_after_id = None
 
-        # 현재 상태에 맞춰 1회만 반영
+        # 트래킹 재개 시 기본은 idle 상태로 복귀시킨다.
+        # _is_pointer_inside_window_precise() 가 다이얼로그 종료 직후 잘못된
+        # hover 판정을 내려 alpha 1.0 으로 고정되는 회귀가 있었음.
+        # 마우스가 실제로 메인 GUI 위에 있다면 후속 motion/enter 이벤트가
+        # 곧 들어와 자연스럽게 hover 로 전환된다.
         try:
             if self._alpha_evt_enabled:
-                if self._is_pointer_inside_window_precise(None):
-                    self._apply_alpha_hover()
-                else:
-                    self._apply_alpha_idle()
+                self._apply_alpha_idle()
         except Exception:
             pass
 
@@ -1337,36 +1338,42 @@ class OverlayApp(ctk.CTk):
             return
         self._goal_ui_guard = True
         try:
-            # 사용자 조작 중이면만 스킵 (비가시는 일부만 스킵)
+            # 최소화(iconic) 상태만 즉시 종료. withdrawn(비가시)라도 복귀 신호는 처리해야 함.
+            try:
+                iconic = (self.state() == "iconic")
+            except Exception:
+                iconic = False
+            if iconic:
+                return
+
+            # ocr_sampling_active 변화(False↔True)는 worker thread 와 GUI 의 동기화 핵심.
+            # ui_busy=True 동안 폴러가 통째로 return 하면 set_ocr_sampling_active(True)
+            # 신호가 평균 1~2s 지연되어 worker 가 캡처 직전 settle polling 에서 정체됨.
+            # 변화 처리는 ui_busy 무시하고 우선 수행, 다른 처리(컨트롤 enable 등)만
+            # ui_busy=True 시 skip.
+            active = get_state_store().is_ocr_sampling_active()
+            prev = getattr(self, "_ocr_auto_overlay_last", False)
+            if active != prev:
+                if active and not prev:
+                    try:
+                        self._ocr_auto_overlay_ctx = self._enter_overlay_mode(keep_goal_poll=True)
+                    except Exception:
+                        self._ocr_auto_overlay_ctx = None
+                elif (not active) and prev:
+                    try:
+                        self._leave_overlay_mode(self._ocr_auto_overlay_ctx)
+                    finally:
+                        self._ocr_auto_overlay_ctx = None
+                self._ocr_auto_overlay_last = bool(active)
+
+            # ui_busy=True 일 땐 나머지 처리(컨트롤 enable 등) 만 skip 하고 폴 종료
             try:
                 if get_state_store().is_ui_busy():
                     return
             except Exception:
                 pass
 
-            viewable = bool(self.winfo_viewable())
-            iconic = (self.state() == "iconic")
-            # 최소화(iconic) 상태만 즉시 종료. withdrawn(비가시)라도 복귀 신호는 처리해야 함.
-            if iconic:
-                return
-
-            active = get_state_store().is_ocr_sampling_active()
-
             self._set_goal_controls_enabled(not active)
-
-            prev = getattr(self, "_ocr_auto_overlay_last", False)
-            if active and not prev:
-                try:
-                    self._ocr_auto_overlay_ctx = self._enter_overlay_mode(keep_goal_poll=True)
-                except Exception:
-                    self._ocr_auto_overlay_ctx = None
-            elif (not active) and prev:
-                try:
-                    self._leave_overlay_mode(self._ocr_auto_overlay_ctx)
-                finally:
-                    self._ocr_auto_overlay_ctx = None
-
-            self._ocr_auto_overlay_last = bool(active)
         finally:
             self._goal_ui_guard = False
             try:
@@ -2001,6 +2008,17 @@ class OverlayApp(ctk.CTk):
         try:
             self.withdraw()
             ctx["was_withdrawn"] = True
+            # worker thread 동기화: withdraw 호출 완료 시각 기록
+            # update_idletasks()로 Tk 의 보류된 작업 강제 처리 → 화면 반영 빨라짐
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            try:
+                import time as _t
+                get_state_store().set_gui_hidden_at(int(_t.time() * 1000))
+            except Exception:
+                pass
         except Exception:
             ctx["was_withdrawn"] = False
         return ctx
@@ -2022,6 +2040,11 @@ class OverlayApp(ctk.CTk):
                 try:
                     self.lift()
                     self.focus_force()
+                except Exception:
+                    pass
+                # GUI 동기화 플래그 clear (visible 상태)
+                try:
+                    get_state_store().set_gui_hidden_at(0)
                 except Exception:
                     pass
         except Exception:
@@ -3678,79 +3701,44 @@ def _crop_with_roi(pil_img, roi):
 
 def _ocr_digits_with_fallback(pil_img):
     """
-    우선순위:
-      0) (있으면) 전용 텍스트 탐지: read_rank_out_of_range_ko → 매칭되면 즉시 (None, raw_t)
-      1) 일반 텍스트 읽기: read_text
-      2) 숫자 읽기: read_digits → 성공 시 (val, raw_d)
-      3) 구버전 숫자 폴백: ocr_digits/detect_score
-      4) 최후: pytesseract 직접(Text→Digits)
+    [v2] GUI OCR 테스트 — 새 파이프라인 사용.
+
+    동작:
+      - PIL → BGR 변환 후 ocr_v2.read_rank_v2 호출
+      - read_rank_v2 는 화이트리스트에 한글+숫자 모두 포함하므로
+        점수(순수 숫자)와 등수(숫자 또는 "순위권 이탈") 둘 다 처리 가능
+      - 반환: (value, raw_text)
+        * 숫자 인식 시: (int, "4393")
+        * "순위권 이탈" 인식 시: (None, "순위권 이탈")
+        * 실패: (None, raw_text 또는 빈문자열)
+
+    이 함수는 검증창에서 "OCR 테스트" 버튼이 호출. 실 루틴과 동일 파이프라인을
+    사용하므로 테스트 결과가 그대로 실 동작을 반영함.
     """
     try:
-        from core import ocr as _ocr
+        import numpy as np
+        import cv2
+        from core import ocr_v2 as _ocrv2
 
-        # (0) 전용 텍스트 탐지 (있을 때만)
-        rr = getattr(_ocr, "read_rank_out_of_range_ko", None)
-        if callable(rr):
-            try:
-                raw_rr = str(rr(pil_img) or "")
-                if raw_rr:  # 전용 탐지 성공(문구 일부라도 잡힘)
-                    return (None, raw_rr)
-            except Exception:
-                pass
+        # PIL(RGB) → BGR numpy
+        arr = np.array(pil_img)
+        if arr.ndim == 2:
+            bgr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        elif arr.shape[2] == 4:
+            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        else:
+            bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-        # (1) 일반 텍스트
-        rt = getattr(_ocr, "read_text", None)
-        raw_t = ""
-        if callable(rt):
-            raw_t = str(rt(pil_img) or "")
-            try:
-                if _is_oor_ko(raw_t):
-                    return (None, raw_t)
-            except Exception:
-                pass
+        # rank 함수가 숫자/한글 모두 처리하므로 그대로 사용
+        result = _ocrv2.read_rank_v2(bgr)
 
-        # (2) 숫자
-        rd = getattr(_ocr, "read_digits", None)
-        if callable(rd):
-            raw_d = str(rd(pil_img) or "")
-            val = _parse_first_int(raw_d)
-            if isinstance(val, int):
-                return (val, raw_d)
-
-        # (3) 구버전 숫자 폴백
-        for fn_name in ("ocr_digits", "detect_score"):
-            fn = getattr(_ocr, fn_name, None)
-            if callable(fn):
-                raw = str(fn(pil_img) or "")
-                val = _parse_first_int(raw)
-                if isinstance(val, int):
-                    return (val, raw)
-                return (None, raw_t or raw)
-
-        if raw_t:
-            return (None, raw_t)
-    except Exception:
-        pass
-
-    # (4) pytesseract 최후 폴백 (Text→Digits)
-    try:
-        import pytesseract
-        raw_t = pytesseract.image_to_string(pil_img, config="--psm 7") or ""
-        try:
-            if _is_oor_ko(raw_t):
-                return (None, raw_t)
-        except Exception:
-            pass
-
-        raw_d = pytesseract.image_to_string(
-            pil_img, config="--psm 7 -c tessedit_char_whitelist=0123456789"
-        ) or ""
-        val = _parse_first_int(raw_d)
-        if isinstance(val, int):
-            return (val, raw_d)
-        return (None, raw_t or raw_d)
+        if result.kind == "OUT_OF_RANGE":
+            return (None, result.raw or "순위권 이탈")
+        if result.kind == "NUMERIC" and isinstance(result.value, int):
+            return (result.value, result.raw)
+        return (None, result.raw or "")
     except Exception as e:
-        return (None, f"no_ocr_module: {type(e).__name__}")
+        return (None, f"ocr_v2_error: {type(e).__name__}")
 
 
 def _parse_first_int(s):
@@ -3823,7 +3811,7 @@ def _run_calib_ocr_and_render(parent_window, result_label, pil_img):
         if isinstance(val, int) and val > 0:
             rank_text, rank_ok = f"등수: {val}등", True
         elif isinstance(raw, str) and _is_oor_ko(raw):
-            rank_text, rank_ok = "등수: (숫자 아님)", True
+            rank_text, rank_ok = "등수: 순위권 이탈", True
 
     # 5) 하단 결과 라벨(한 줄) 업데이트
     overall_color = _COLOR_OK if (pts_ok and rank_ok) else _COLOR_WARN

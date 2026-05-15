@@ -1,8 +1,18 @@
 # lock_utils.py
 import os
-import psutil
 
 LOCK_FILE = "routine.lock"
+
+
+def _pid_exists(pid: int) -> bool:
+    """psutil 없이 PID 존재 여부 확인 (Windows 전용, ctypes 사용)."""
+    import ctypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    return False
 
 
 def create_lock():
@@ -17,7 +27,6 @@ def remove_lock():
 
 def release_lock(lock_path: str):
     try:
-        import os
         if os.path.exists(lock_path):
             os.remove(lock_path)
     except Exception:
@@ -28,7 +37,7 @@ def acquire_lock(lock_path: str) -> bool:
     """
     단일 실행 보장. stale은 조용히 청소.
     """
-    import os, json, time
+    import json, time
     silent_cleanup_stale_lock(lock_path)
     if os.path.exists(lock_path):
         return False
@@ -48,7 +57,7 @@ def check_stale_lock():
         with open(LOCK_FILE, "r") as f:
             pid = int(f.read().strip())
 
-        if psutil.pid_exists(pid):
+        if _pid_exists(pid):
             return True  # 여전히 실행 중
         else:
             os.remove(LOCK_FILE)
@@ -63,7 +72,7 @@ def silent_cleanup_stale_lock(lock_path: str, pid_getter=None):
     """
     stale lock 발견 시 아무 메시지도 남기지 않고 조용히 정리.
     """
-    import os, json, psutil
+    import json
     try:
         if not os.path.exists(lock_path):
             return
@@ -79,7 +88,7 @@ def silent_cleanup_stale_lock(lock_path: str, pid_getter=None):
             os.remove(lock_path)
             return
         # 프로세스 존재 여부
-        if not psutil.pid_exists(pid):
+        if not _pid_exists(pid):
             os.remove(lock_path)
             return
         # 같은 앱인지 더 확인할 수도 있으나, 여기선 침묵 유지

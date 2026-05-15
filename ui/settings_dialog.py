@@ -4,7 +4,7 @@ import threading
 import webbrowser
 import customtkinter as ctk
 from tkinter import messagebox
-from version import APP_VERSION
+from version import APP_VERSION, DEV_MODE
 from core import updater as _updater
 import autoemail
 from path_manager import BASE_DIR, get_img_path  # ← 추가
@@ -2790,6 +2790,59 @@ class SettingsDialog(ctk.CTkToplevel):
         self._upd_release_info: dict | None = None
         self._upd_downloading = False
 
+        # ── 개발자 모드 전용 UI ─────────────────────────────────────
+        if DEV_MODE:
+            sep = ctk.CTkFrame(parent, height=1, fg_color="#333")
+            sep.grid(row=8, column=0, sticky="ew", padx=24, pady=(16, 8))
+
+            ctk.CTkLabel(
+                parent,
+                text="개발자 모드 — Pre-release 포함 버전 선택",
+                text_color="#facc15",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=9, column=0, sticky="w", padx=24, pady=(0, 4))
+
+            dev_btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            dev_btn_frame.grid(row=10, column=0, sticky="w", padx=24, pady=(0, 4))
+
+            self._dev_load_btn = ctk.CTkButton(
+                dev_btn_frame, text="릴리즈 목록 불러오기",
+                fg_color="#78350f", hover_color="#92400e",
+                command=self._dev_load_releases,
+            )
+            self._dev_load_btn.pack(side="left")
+
+            self._dev_version_var = ctk.StringVar(value="")
+            self._dev_version_menu = ctk.CTkOptionMenu(
+                dev_btn_frame,
+                variable=self._dev_version_var,
+                values=["목록을 먼저 불러오세요"],
+                command=self._dev_on_version_select,
+                width=200,
+            )
+            self._dev_version_menu.pack(side="left", padx=(8, 0))
+
+            self._dev_status_lbl = ctk.CTkLabel(parent, text="", text_color="gray", font=ctk.CTkFont(size=11))
+            self._dev_status_lbl.grid(row=11, column=0, sticky="w", padx=24)
+
+            self._dev_body_box = ctk.CTkTextbox(parent, height=80, state="disabled", wrap="word")
+            self._dev_body_box.grid(row=12, column=0, sticky="ew", padx=24, pady=(4, 4))
+
+            self._dev_dl_btn = ctk.CTkButton(
+                parent, text="이 버전으로 교체",
+                fg_color="#7c3aed", hover_color="#6d28d9",
+                state="disabled",
+                command=self._dev_start_download,
+            )
+            self._dev_dl_btn.grid(row=13, column=0, sticky="w", padx=24, pady=(0, 8))
+
+            self._dev_progress = ctk.CTkProgressBar(parent)
+            self._dev_progress.set(0)
+            self._dev_progress_lbl = ctk.CTkLabel(parent, text="", text_color="gray", font=ctk.CTkFont(size=11))
+
+            self._dev_all_releases: list[dict] = []
+            self._dev_selected_release: dict | None = None
+
     def _upd_check_now(self):
         """업데이트 확인 버튼 핸들러 — 백그라운드 스레드에서 API 호출."""
         self._upd_check_btn.configure(state="disabled", text="확인 중...")
@@ -2805,16 +2858,19 @@ class SettingsDialog(ctk.CTkToplevel):
 
         def _run():
             info = _updater.check_latest_release()
-            self.after(0, lambda: self._upd_on_result(info))
+            err = _updater.check_latest_release.last_error
+            self.after(0, lambda: self._upd_on_result(info, err))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _upd_on_result(self, info: dict | None):
+    def _upd_on_result(self, info: dict | None, err: str = ""):
         self._upd_check_btn.configure(state="normal", text="업데이트 확인")
         if info is None:
-            self._upd_status_lbl.configure(
-                text="버전 정보를 가져오지 못했습니다. (네트워크 확인)", text_color="#f87171",
-            )
+            if err:
+                msg = f"버전 정보를 가져오지 못했습니다.\n{err}"
+            else:
+                msg = "버전 정보를 가져오지 못했습니다. (네트워크 확인)"
+            self._upd_status_lbl.configure(text=msg, text_color="#f87171")
             return
 
         self._upd_release_info = info
@@ -2904,16 +2960,23 @@ class SettingsDialog(ctk.CTkToplevel):
         exe_asset = self._upd_release_info.get("exe_asset")
         if not exe_asset:
             return
+
+        # 즉시 비활성화 — 중복 클릭 방지
+        self._upd_dl_btn.configure(state="disabled", text="적용 중...")
+
         from path_manager import BASE_DIR
         dest = BASE_DIR / exe_asset["name"]
-        try:
-            _updater.apply_update(dest)
-        except RuntimeError as e:
-            messagebox.showinfo(
-                "안내",
-                f"{e}\n\n다운로드된 파일:\n{dest}\n\n현재 exe와 수동으로 교체해 주세요.",
-                parent=self,
-            )
+
+        if not dest.exists():
+            messagebox.showerror("오류", f"다운로드된 파일을 찾을 수 없습니다.\n{dest}", parent=self)
+            self._upd_dl_btn.configure(state="normal", text="재시작하여 업데이트 적용", fg_color="#16a34a")
+            return
+
+        # 설정창을 먼저 닫은 뒤 부모 위젯을 통해 apply_update 실행
+        # (sys.exit가 tkinter 콜백 내에서 catch되는 문제 방지)
+        master = self.master
+        self.destroy()
+        master.after(200, lambda: _updater.apply_update(dest))
 
     def _upd_on_download_error(self, msg: str):
         try:
@@ -2921,5 +2984,158 @@ class SettingsDialog(ctk.CTkToplevel):
             self._upd_dl_btn.configure(state="normal", text="다시 시도", fg_color="#2563eb")
             self._upd_check_btn.configure(state="normal")
             self._upd_progress_lbl.configure(text=f"오류: {msg}", text_color="#f87171")
+        except Exception:
+            pass
+
+    # ───────────────────────────────────────────────────────────────
+    # 개발자 모드 — 전체 릴리즈 목록 / 버전 선택 교체
+    # ───────────────────────────────────────────────────────────────
+
+    def _dev_load_releases(self):
+        if not DEV_MODE:
+            return
+        self._dev_load_btn.configure(state="disabled", text="불러오는 중...")
+        self._dev_status_lbl.configure(text="GitHub에서 전체 릴리즈 목록을 가져오는 중...", text_color="gray")
+
+        def _run():
+            releases = _updater.check_all_releases()
+            err = _updater.check_all_releases.last_error
+            self.after(0, lambda: self._dev_on_releases_loaded(releases, err))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _dev_on_releases_loaded(self, releases: list[dict] | None, err: str):
+        self._dev_load_btn.configure(state="normal", text="릴리즈 목록 불러오기")
+        if releases is None:
+            self._dev_status_lbl.configure(
+                text=f"목록 로드 실패: {err}" if err else "목록 로드 실패 (네트워크 확인)",
+                text_color="#f87171",
+            )
+            return
+
+        self._dev_all_releases = releases
+        if not releases:
+            self._dev_status_lbl.configure(text="릴리즈가 없습니다.", text_color="gray")
+            return
+
+        labels = []
+        for r in releases:
+            tag = r.get("tag_name", "(unknown)")
+            pre = "  [pre]" if r.get("prerelease") else ""
+            exe = "  ✓exe" if r.get("exe_asset") else "  ✗exe없음"
+            labels.append(f"{tag}{pre}{exe}")
+
+        self._dev_version_menu.configure(values=labels)
+        self._dev_version_var.set(labels[0])
+        self._dev_on_version_select(labels[0])
+        self._dev_status_lbl.configure(text=f"총 {len(releases)}개 릴리즈", text_color="gray")
+
+    def _dev_on_version_select(self, label: str):
+        if not self._dev_all_releases:
+            return
+        labels = self._dev_version_menu.cget("values")
+        try:
+            idx = list(labels).index(label)
+        except ValueError:
+            return
+        rel = self._dev_all_releases[idx]
+        self._dev_selected_release = rel
+
+        body = (rel.get("body") or "").strip()
+        self._dev_body_box.configure(state="normal")
+        self._dev_body_box.delete("1.0", "end")
+        self._dev_body_box.insert("1.0", body or "(변경사항 없음)")
+        self._dev_body_box.configure(state="disabled")
+
+        has_exe = rel.get("exe_asset") is not None
+        self._dev_dl_btn.configure(state="normal" if has_exe else "disabled")
+
+    def _dev_start_download(self):
+        if not DEV_MODE or self._upd_downloading:
+            return
+        rel = self._dev_selected_release
+        if rel is None:
+            return
+        exe_asset = rel.get("exe_asset")
+        if not exe_asset:
+            return
+
+        from path_manager import BASE_DIR
+        dest = BASE_DIR / exe_asset["name"]
+
+        self._upd_downloading = True
+        self._dev_dl_btn.configure(state="disabled", text="다운로드 중...")
+        self._dev_load_btn.configure(state="disabled")
+
+        self._dev_progress.grid(row=14, column=0, sticky="ew", padx=24, pady=(0, 2))
+        self._dev_progress_lbl.grid(row=15, column=0, sticky="w", padx=24)
+
+        def _progress(done, total):
+            if total > 0:
+                ratio = done / total
+                label = f"{done/1_048_576:.1f} / {total/1_048_576:.1f} MB"
+            else:
+                ratio = 0
+                label = f"{done/1_048_576:.1f} MB"
+            self.after(0, lambda r=ratio, l=label: self._dev_progress_ui(r, l))
+
+        def _run():
+            try:
+                _updater.download_exe(exe_asset["url"], dest, progress_cb=_progress)
+                self.after(0, lambda: self._dev_on_download_done(dest, rel))
+            except Exception as e:
+                self.after(0, lambda: self._dev_on_download_error(str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _dev_progress_ui(self, ratio: float, label: str):
+        try:
+            self._dev_progress.set(ratio)
+            self._dev_progress_lbl.configure(text=label)
+        except Exception:
+            pass
+
+    def _dev_on_download_done(self, dest, rel: dict):
+        try:
+            self._dev_progress.set(1.0)
+            self._dev_progress_lbl.configure(text="다운로드 완료!")
+            tag = rel.get("tag_name", "")
+            self._dev_dl_btn.configure(
+                state="normal",
+                text=f"재시작하여 {tag} 적용",
+                fg_color="#16a34a",
+                command=lambda: self._dev_apply(dest),
+            )
+            self._dev_load_btn.configure(state="normal")
+            self._upd_downloading = False
+        except Exception:
+            pass
+
+    def _dev_apply(self, dest):
+        # 즉시 비활성화 — 중복 클릭 방지
+        try:
+            self._dev_dl_btn.configure(state="disabled", text="적용 중...")
+        except Exception:
+            pass
+
+        if not dest.exists():
+            messagebox.showerror("오류", f"다운로드된 파일을 찾을 수 없습니다.\n{dest}", parent=self)
+            try:
+                self._dev_dl_btn.configure(state="normal", text="재시작하여 적용", fg_color="#16a34a")
+            except Exception:
+                pass
+            return
+
+        # 설정창 먼저 닫고 부모 위젯을 통해 apply_update 실행
+        master = self.master
+        self.destroy()
+        master.after(200, lambda: _updater.apply_update(dest))
+
+    def _dev_on_download_error(self, msg: str):
+        try:
+            self._upd_downloading = False
+            self._dev_dl_btn.configure(state="normal", text="이 버전으로 교체", fg_color="#7c3aed")
+            self._dev_load_btn.configure(state="normal")
+            self._dev_progress_lbl.configure(text=f"오류: {msg}", text_color="#f87171")
         except Exception:
             pass
